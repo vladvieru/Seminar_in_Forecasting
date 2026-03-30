@@ -6,7 +6,7 @@ combination method for unstable environments.
 
 Layers
 ------
-1. Local prediction of future pairwise loss differentials (Richter–Smetanina style)
+1. Local prediction of future pairwise loss differentials (Richter-Smetanina style)
 2. Graph aggregation via eigenvector centrality
 3. Covariance-aware simplex-constrained weight optimization with shrinkage
 
@@ -76,12 +76,17 @@ LOSS_REGISTRY: Dict[str, Callable] = {
 # ===================================================================
 # 2.  LOCAL PAIRWISE LOSS-DIFFERENTIAL MODEL  (Richter–Smetanina style)
 # ===================================================================
+import numpy as np
+from typing import Tuple, Optional
+from dataclasses import dataclass
+
+EPS = 1e-10
 
 # ---------- kernel ----------
 
 def epanechnikov_kernel(u: np.ndarray) -> np.ndarray:
-    """Epanechnikov kernel  K(u) = 0.75*(1-u^2)  for |u|<=1, else 0."""
-    w = np.zeros_like(u)
+    """Epanechnikov kernel K(u) = 0.75*(1-u^2) for |u|<=1, else 0."""
+    w = np.zeros_like(u, dtype=float)
     mask = np.abs(u) <= 1.0
     w[mask] = 0.75 * (1.0 - u[mask] ** 2)
     return w
@@ -95,13 +100,13 @@ def _build_ar_design(series: np.ndarray, d: int) -> Tuple[np.ndarray, np.ndarray
 
     Returns
     -------
-    Y : shape (n-d,)
-    X : shape (n-d, d+1)   columns = [1, lag1, lag2, ..., lag_d]
+    Y : shape (T-d,)
+    X : shape (T-d, d+1)   columns = [1, lag1, ..., lag_d]
     """
     n = len(series)
     if n <= d:
         raise ValueError("Series too short for AR({})".format(d))
-    Y = series[d:]
+    Y = series[d:].copy()
     X = np.ones((n - d, d + 1))
     for k in range(1, d + 1):
         X[:, k] = series[d - k: n - k]
@@ -113,51 +118,107 @@ def local_linear_ar_fit(
     d: int,
     h: float,
     target_frac: float = 1.0,
+    t_filter: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Local linear AR(d) fit at rescaled time *target_frac* (in [0,1]).
+    Local linear AR(d) fit at rescaled time *target_frac*.
 
-    Uses Epanechnikov kernel centred at *target_frac* with bandwidth *h*.
+    Builds the augmented Z_t(u) = [X_{t-1}, (t/T - u)*X_{t-1}] design
+    matrix (size 2*(d+1)) as in equation (3) of the paper, estimates
+    theta(u) via WLS, and returns the first (d+1) components as rho(u).
 
     Parameters
     ----------
-    series : 1-d array of length T
-    d      : AR lag order
-    h      : bandwidth (on the [0,1] scale)
-    target_frac : point at which to localise (usually T/T = 1.0 for forecasting)
+    series      : 1-d array of length T
+    d           : AR lag order
+    h           : bandwidth on [0,1] scale
+    target_frac : evaluation point u (usually 1.0 for forecasting)
+    t_filter    : optional array of length T; 0 = exclude, 1 = include.
+                  Applied to the (T-d) observation rows after lag truncation.
 
     Returns
     -------
-    beta  : estimated local AR coefficients  (d+1,)
-    resid : weighted residuals              (n,)
-    W_diag: kernel weights                   (n,)
+    beta    : rho(u) estimate, shape (d+1,)  [first half of theta(u)]
+    resid   : Y - X @ beta, shape (T-d,)
+    W_diag  : kernel weights, shape (T-d,)
     """
     Y, X = _build_ar_design(series, d)
-    n = len(Y)
-    fracs = (np.arange(d, d + n) + 1) / (d + n)  # rescaled times for each obs
+    n = len(Y)  # = T - d
+    T = len(series)
+
+    # rescaled time for each observation row (index d, d+1, ..., T-1)
+    fracs = np.arange(d, T) / T
+
+    # kernel weights centred at target_frac
     u = (fracs - target_frac) / max(h, EPS)
     W_diag = epanechnikov_kernel(u)
 
-    # Weighted least squares
-    Ws = np.sqrt(W_diag + EPS)
-    Xw = X * Ws[:, None]
-    Yw = Y * Ws
+    # apply t_filter if supplied (operates on the post-lag rows)
+    if t_filter is not None:
+        W_diag = W_diag * t_filter[d:]
+
+    # build augmented local linear design matrix Z_t(u) of size (n, 2*(d+1))
+    # top block: X  (the standard AR regressors)
+    # bottom block: (t/T - u) * X  (local linear expansion)
+    delta = (fracs - target_frac)[:, None]   # shape (n, 1)
+    X_ll = X * delta                          # (t/T - u) * X, shape (n, d+1)
+    Z = np.hstack([X, X_ll])                  # shape (n, 2*(d+1))
+
+    # WLS: (Z'WZ)^{-1} Z'WY  where W = diag(W_diag)
+    ZW = Z * W_diag[:, None]                  # row-wise kernel weighting
+    ZWZ = ZW.T @ Z                            # shape (2*(d+1), 2*(d+1))
+    ZWY = ZW.T @ Y                            # shape (2*(d+1),)
+
     try:
-        beta, _, _, _ = np.linalg.lstsq(Xw, Yw, rcond=None)
-    except LinAlgError:
-        beta = np.zeros(d + 1)
+        theta = np.linalg.solve(ZWZ, ZWY)
+    except np.linalg.LinAlgError:
+        theta = np.zeros(2 * (d + 1))
+
+    # rho(u) is the first (d+1) components of theta
+    beta = theta[:d + 1]
     resid = Y - X @ beta
     return beta, resid, W_diag
 
 
+def _estimate_full_sequence(
+    series: np.ndarray,
+    d: int,
+    h: float,
+    t_filter: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Estimate rho(t/T) and compute residuals at every t/T, matching the
+    second code's est_theta_general vectorised loop.
+
+    Returns
+    -------
+    rho_seq  : shape (T-d, d+1)  — rho(t/T) for t = d, ..., T-1
+    resid_seq: shape (T-d,)      — L_t - X_{t-1}' rho(t/T)
+    """
+    Y, X = _build_ar_design(series, d)
+    n = len(Y)
+    T = len(series)
+    fracs = np.arange(d, T) / T
+
+    rho_seq = np.empty((n, d + 1))
+    for i in range(n):
+        t_frac = fracs[i]
+        beta, _, _ = local_linear_ar_fit(
+            series, d, h, target_frac=t_frac, t_filter=t_filter
+        )
+        rho_seq[i] = beta
+
+    resid_seq = Y - np.sum(X * rho_seq, axis=1)
+    return rho_seq, resid_seq
+
+
 def local_predict_mean(series: np.ndarray, d: int, h: float) -> float:
     """
-    One-step-ahead conditional mean forecast from local AR(d).
+    One-step-ahead conditional mean forecast from local linear AR(d).
     Localises at the boundary (target_frac = 1.0).
+
+    Returns X_T' @ rho_hat(1) where X_T = [1, L_T, ..., L_{T-d+1}].
     """
-    if d == 0:
-        beta, _, _ = local_linear_ar_fit(series, 0, h, target_frac=1.0)
-        return float(beta[0])
     beta, _, _ = local_linear_ar_fit(series, d, h, target_frac=1.0)
     x_new = np.ones(d + 1)
     for k in range(1, d + 1):
@@ -172,20 +233,39 @@ def local_predict_scale(
     h2: float,
 ) -> float:
     """
-    Local scale (std-dev) estimate from second-stage kernel regression
-    on squared residuals of the first-stage local AR(d).
+    Local scale (std-dev) estimate at u=1 from second-stage local linear
+    kernel regression on squared residuals of the first-stage local AR(d).
+
+    Computes residuals xi_t = L_t - X_{t-1}' rho_hat(t/T) for each t
+    using the time-appropriate coefficient, matching est_theta_general
+    in the second code. Then runs local linear regression of xi_t^2 on
+    rescaled time, evaluated at u=1.
     """
-    beta, resid, _ = local_linear_ar_fit(series, d, h1, target_frac=1.0)
-    sq_resid = resid ** 2
-    # second stage: local constant regression of sq_resid
-    n = len(sq_resid)
-    fracs = (np.arange(d, d + n) + 1) / (d + n)
-    u = (fracs - 1.0) / max(h2, EPS)
-    W2 = epanechnikov_kernel(u)
-    denom = W2.sum()
-    if denom < EPS:
-        return float(np.sqrt(np.mean(sq_resid) + EPS))
-    var_est = (W2 * sq_resid).sum() / denom
+    T = len(series)
+    n = T - d
+
+    # --- stage 1: time-varying residuals using rho(t/T) at each t ---
+    _, resid_seq = _estimate_full_sequence(series, d, h1)
+    sq_resid = resid_seq ** 2
+
+    # --- stage 2: local linear regression of sq_resid on rescaled time ---
+    # F_t(u) = [1, t/T - u], evaluated at u = 1
+    fracs = np.arange(d, T) / T
+    u2 = (fracs - 1.0) / max(h2, EPS)
+    W2 = epanechnikov_kernel(u2)
+
+    delta2 = (fracs - 1.0)[:, None]
+    F = np.hstack([np.ones((n, 1)), delta2])   # shape (n, 2)
+    FW = F * W2[:, None]
+    FWF = FW.T @ F
+    FWsq = FW.T @ sq_resid
+
+    try:
+        varsigma = np.linalg.solve(FWF, FWsq)
+        var_est = float(varsigma[0])           # first component = sigma^2(1)
+    except np.linalg.LinAlgError:
+        var_est = float(np.mean(sq_resid))
+
     return float(np.sqrt(max(var_est, EPS)))
 
 
@@ -195,29 +275,56 @@ def bic_lag_selection(
     series: np.ndarray,
     d_max: int,
     h: float,
+    correct_bic: bool = False,
 ) -> int:
     """
-    Select AR lag order d in {0,...,d_max} via BIC evaluated at
-    the boundary using local kernel weights.
+    Select AR lag order d in {0,...,d_max} via BIC.
+
+    Parameters
+    ----------
+    series      : 1-d array of length T
+    d_max       : maximum lag order to consider
+    h           : preliminary bandwidth for estimation
+    correct_bic : if True, uses the paper's BIC formulation (eq. 7):
+                      BIC(d) = sum_t log(sigma^2(t/T)) + (d+1)*log(T-d)
+                  if False (default), uses the original approximate formulation.
+
+    Returns
+    -------
+    best_d : int
     """
     T = len(series)
     best_d = 0
     best_bic = np.inf
+
     for d in range(0, d_max + 1):
         if T <= d + 2:
             continue
-        beta, resid, W_diag = local_linear_ar_fit(series, d, h, target_frac=1.0)
-        n_eff = W_diag.sum()
-        if n_eff < d + 2:
-            continue
-        sse = (W_diag * resid ** 2).sum()
-        sigma2 = sse / max(n_eff, EPS)
-        if sigma2 <= 0:
-            continue
-        bic = np.log(sigma2 + EPS) + (d + 1) * np.log(max(n_eff, 2)) / max(n_eff, 1)
+
+        if correct_bic:
+            # paper's BIC (eq. 7): sum over t of log(sigma^2(t/T)) + (d+1)*log(T-d)
+            # use time-varying residuals at each t/T then take as sigma^2(t/T) estimate
+            _, resid_seq = _estimate_full_sequence(series, d, h)
+            sigma2_seq = np.maximum(resid_seq ** 2, EPS)
+            bic = np.sum(np.log(sigma2_seq)) + (d + 1) * np.log(T - d)
+        else:
+            # original approximate formulation
+            beta, resid, W_diag = local_linear_ar_fit(
+                series, d, h, target_frac=1.0
+            )
+            n_eff = W_diag.sum()
+            if n_eff < d + 2:
+                continue
+            sse = (W_diag * resid ** 2).sum()
+            sigma2 = sse / max(n_eff, EPS)
+            if sigma2 <= 0:
+                continue
+            bic = np.log(sigma2 + EPS) + (d + 1) * np.log(max(n_eff, 2)) / max(n_eff, 1)
+
         if bic < best_bic:
             best_bic = bic
             best_d = d
+
     return best_d
 
 
@@ -227,46 +334,62 @@ def cv_bandwidth_selection(
     series: np.ndarray,
     d: int,
     h_grid: np.ndarray,
-    n_folds: int = 5,
+    n_folds: int = 20,
 ) -> Tuple[float, np.ndarray]:
     """
-    Blocked cross-validation for bandwidth selection.
+    Interleaved cross-validation for bandwidth selection, matching the
+    paper's fold structure zeta_j = {Q*k + j, k=1,2,...} with Q=n_folds.
 
-    Uses *n_folds* contiguous blocks; each fold is left out in turn.
+    Each held-out observation i is predicted using the model estimated
+    without its fold, evaluated at its own rescaled time u = i/T, exactly
+    matching the second code's h1_CV_calc behaviour.
+
+    CV score is mean of per-fold means, matching np.mean(CV_Q) in the
+    second code.
+
     Returns (best_h, cv_scores).
     """
     T = len(series)
-    if T <= d + 2:
-        return (float(h_grid[len(h_grid) // 2]), np.full(len(h_grid), np.nan))
-
-    indices = np.arange(d, T)
-    block_size = max(len(indices) // n_folds, 1)
+    Q = n_folds
     cv_scores = np.full(len(h_grid), np.nan)
 
+    if T <= d + 2:
+        return float(h_grid[len(h_grid) // 2]), cv_scores
+
+    Y_full, X_full = _build_ar_design(series, d)
+    n = len(Y_full)  # T - d
+
     for ih, h in enumerate(h_grid):
-        total_err = 0.0
-        count = 0
-        for fold in range(n_folds):
-            start = d + fold * block_size
-            end = min(start + block_size, T)
-            if end <= start:
+        fold_mse = np.zeros(Q)
+
+        for j in range(Q):
+            # interleaved fold indices into post-lag rows 0..n-1
+            fold_idx = np.arange(j, n, Q)
+            if len(fold_idx) == 0:
                 continue
-            mask = np.ones(T, dtype=bool)
-            mask[start:end] = False
-            sub_series = series[mask]
-            if len(sub_series) <= d + 2:
-                continue
-            Y_val, X_val = _build_ar_design(series, d)
-            beta_cv, _, _ = local_linear_ar_fit(sub_series, d, h, target_frac=1.0)
-            # evaluate on left-out block
-            for s in range(start - d, end - d):
-                if 0 <= s < len(Y_val):
-                    pred = X_val[s] @ beta_cv
-                    total_err += (Y_val[s] - pred) ** 2
-                    count += 1
-        if count > 0:
-            cv_scores[ih] = total_err / count
-    best_idx = np.nanargmin(cv_scores)
+
+            # t_filter: exclude fold members (original indices fold_idx + d)
+            t_filter = np.ones(T)
+            t_filter[fold_idx + d] = 0.0
+
+            # evaluate at each held-out observation's own rescaled time
+            # matching second code: resid[d:][dj] uses rho(s/T) at each s
+            sq_errors = np.empty(len(fold_idx))
+            for k, idx in enumerate(fold_idx):
+                t_frac = (idx + d) / T
+                beta_cv, _, _ = local_linear_ar_fit(
+                    series, d, h,
+                    target_frac=t_frac,
+                    t_filter=t_filter,
+                )
+                pred = X_full[idx] @ beta_cv
+                sq_errors[k] = (Y_full[idx] - pred) ** 2
+
+            fold_mse[j] = np.mean(sq_errors)
+
+        cv_scores[ih] = np.mean(fold_mse)   # mean of fold means, matching second code
+
+    best_idx = int(np.nanargmin(cv_scores))
     return float(h_grid[best_idx]), cv_scores
 
 
@@ -299,46 +422,58 @@ def predict_pairwise_ld(
     fixed_d: Optional[int] = None,
     fixed_h1: Optional[float] = None,
     fixed_h2: Optional[float] = None,
-    n_cv_folds: int = 5,
+    n_cv_folds: int = 20,
+    correct_bic: bool = False,
 ) -> PairwiseLDResult:
     """
-    Given a history of pairwise loss differentials (up to time t),
+    Given a history of pairwise loss differentials (up to time T),
     produce next-period conditional mean and scale estimates.
+
+    Parameters
+    ----------
+    delta_L     : 1-d array of loss differences L_t = Loss_A - Loss_B
+    d_max       : maximum lag order for BIC selection
+    h1_grid     : bandwidth grid for first-stage CV (default: log-spaced)
+    h2_grid     : bandwidth grid for second-stage CV (default: log-spaced)
+    fixed_d     : fix lag order, bypassing BIC selection
+    fixed_h1    : fix first-stage bandwidth, bypassing CV
+    fixed_h2    : fix second-stage bandwidth, bypassing CV
+    n_cv_folds  : number of interleaved CV folds (paper recommends Q>=20)
+    correct_bic : if True use paper's BIC formulation; if False use
+                  approximate formulation (default False)
+
+    Returns
+    -------
+    PairwiseLDResult with mu_hat, sigma_hat, and selected d, h1, h2
     """
     T = len(delta_L)
     if T < 5:
-        return PairwiseLDResult()  # too short
+        return PairwiseLDResult()
 
     if h1_grid is None:
         h1_grid = make_h_grid(12, 0.05, 1.0)
     if h2_grid is None:
         h2_grid = make_h_grid(10, 0.10, 1.0)
 
-    # preliminary bandwidth for BIC
     h_prelim = float(h1_grid[len(h1_grid) // 2])
 
     # lag selection
     if fixed_d is not None:
         d = fixed_d
     else:
-        d = bic_lag_selection(delta_L, d_max, h_prelim)
+        d = bic_lag_selection(delta_L, d_max, h_prelim, correct_bic=correct_bic)
 
-    # bandwidth selection h1
+    # bandwidth h1
     if fixed_h1 is not None:
         h1 = fixed_h1
     else:
         h1, _ = cv_bandwidth_selection(delta_L, d, h1_grid, n_cv_folds)
 
-    # re-select d at chosen h1
-    if fixed_d is None:
-        d = bic_lag_selection(delta_L, d_max, h1)
-
-    # bandwidth selection h2
+    # bandwidth h2
     if fixed_h2 is not None:
         h2 = fixed_h2
     else:
-        # simple choice: use h2 moderately larger than h1
-        h2 = min(h1 * 1.5, 1.0)
+        h2, _ = cv_bandwidth_selection(delta_L, d, h2_grid, n_cv_folds)
 
     mu = local_predict_mean(delta_L, d, h1)
     sigma = local_predict_scale(delta_L, d, h1, h2)
@@ -712,7 +847,7 @@ def bates_granger_weights(
     ridge: float = RIDGE_COV,
 ) -> np.ndarray:
     """
-    Bates–Granger inverse-variance weights (diagonal),
+    Bates-Granger inverse-variance weights (diagonal),
     then simplex projection.
     """
     T, M = errors.shape
@@ -740,7 +875,7 @@ def rs_selection_weights(
     mu_matrix: np.ndarray,
 ) -> np.ndarray:
     """
-    Richter–Smetanina style selection: pick forecast i that is predicted
+    Richter-Smetanina style selection: pick forecast i that is predicted
     to beat the most others (largest net outperformance count).
     """
     M = mu_matrix.shape[0]
@@ -762,55 +897,110 @@ def rs_selection_weights(
 
 @dataclass
 class ScenarioConfig:
-    """Configuration for a single simulation scenario."""
+    """
+    Store the configuration for a single simulation scenario.
+
+    The configuration controls the number of forecasters and time periods, the
+    common-shock component, the bias process, the idiosyncratic variance
+    process, optional outliers, and optional cross-sectional dependence through
+    either a one-factor or clustered structure.
+    """
     name: str = "default"
-    M: int = 8
-    T: int = 400
-    T0: int = 200        # start of OOS evaluation
-    sigma_common: float = 0.5
+    M: int = 8           # Number of forecasters
+    T: int = 400         # Total number of time periods
+    T0: int = 200        # First out-of-sample evaluation index
+    sigma_common: float = 0.5   # Standard deviation of the common shock
     seed: int = 42
 
-    # bias params
-    bias_type: str = "zero"  # zero, constant, break, drift, cluster
-    bias_values: Optional[np.ndarray] = None
-    bias_break_time: Optional[int] = None
-    bias_pre: Optional[np.ndarray] = None
-    bias_post: Optional[np.ndarray] = None
-    bias_drift_speed: float = 0.01
-    bias_centered: bool = True
+    # Bias parameters
+    bias_type: str = "zero"  # One of: zero, constant, break, drift, cluster
+    bias_values: Optional[np.ndarray] = None  # Fixed bias vector, shape (M,)
+    bias_break_time: Optional[int] = None  # Break date for bias_type="break"
+    bias_pre: Optional[np.ndarray] = None  # Bias vector before the break
+    bias_post: Optional[np.ndarray] = None  # Bias vector after the break
+    bias_drift_speed: float = 0.01  # Fallback drift scale if eta2 is not given
+    bias_centered: bool = True  # Remove cross-sectional mean bias if True
+    bias_init_low: float = 0.0  # Lower bound for random initial biases
+    bias_init_high: float = 1.0  # Upper bound for random initial biases
+    bias_drift_rho: float = 0.95  # Persistence of the latent bias slope
+    bias_drift_eta2: Optional[float] = None  # Innovation variance of drift slope
 
-    # variance params
-    sigma_idio: Optional[np.ndarray] = None  # shape (M,) or (T,M)
-    sigma_shift_time: Optional[int] = None
-    sigma_pre: Optional[np.ndarray] = None
-    sigma_post: Optional[np.ndarray] = None
+    # Variance parameters
+    sigma_idio: Optional[np.ndarray] = None  # Fixed sigma path, shape (M,) or (T, M)
+    sigma_process: str = "constant"  # One of: constant, break, smooth_precision
+    base_sigma2: float = 1.0  # Baseline variance used in smooth-precision mode
+    sigma_shift_time: Optional[int] = None  # Break date for piecewise sigma paths
+    sigma_pre: Optional[np.ndarray] = None  # Sigma vector before the variance shift
+    sigma_post: Optional[np.ndarray] = None  # Sigma vector after the variance shift
+    sigma_drift_rho: float = 0.95  # Persistence of the latent log-precision slope
+    sigma_drift_eta2: float = 8e-4  # Innovation variance of the precision slope
+    log_precision_min: float = -2.0  # Lower truncation bound for log precision
+    log_precision_max: float = 2.0  # Upper truncation bound for log precision
 
-    # outlier params
-    outlier_prob: float = 0.0
-    outlier_scale: float = 5.0
+    # Outlier parameters
+    outlier_prob: float = 0.0  # Per-entry probability of replacing idio noise
+    outlier_scale: float = 5.0  # Maximum outlier multiplier relative to sigma
+    outlier_min_scale: float = 2.0  # Minimum outlier multiplier relative to sigma
 
-    # dependence params
-    factor_rho: Optional[np.ndarray] = None  # (M,) factor loadings
-    n_clusters: int = 1
-    cluster_labels: Optional[np.ndarray] = None
-    cluster_rho: float = 0.6
+    # Dependence parameters
+    factor_rho: Optional[np.ndarray] = None  # One-factor loadings, shape (M,)
+    n_clusters: int = 1  # Number of clusters in clustered dependence mode
+    cluster_labels: Optional[np.ndarray] = None  # Cluster assignment for each forecaster
+    cluster_rho: float = 0.6  # Loading on the cluster-specific latent factor
 
 
 @dataclass
 class SimulationData:
-    """Container for simulated data."""
-    y: np.ndarray               # (T,) target
+    """
+    Store the output of a simulation run.
+
+    Attributes:
+        y (np.ndarray): Realized target series of shape (T,)
+        forecasts (np.ndarray): Forecast matrix of shape (T, M)
+        errors (np.ndarray): Forecast-error matrix of shape (T, M)
+        losses (np.ndarray): Loss matrix of shape (T, M)
+        bias_paths (np.ndarray): Bias process for each forecaster, shape (T, M)
+        sigma_paths (np.ndarray): Idiosyncratic scale paths, shape (T, M)
+        common_shock (np.ndarray): Common shock series of shape (T,)
+        config (ScenarioConfig): Configuration used to generate the data
+    """
+    y: np.ndarray               # (T,) realized target series
     forecasts: np.ndarray       # (T, M) forecast values
     errors: np.ndarray          # (T, M) forecast errors
-    losses: np.ndarray          # (T, M) losses
-    bias_paths: np.ndarray      # (T, M)
-    sigma_paths: np.ndarray     # (T, M)
-    common_shock: np.ndarray    # (T,)
+    losses: np.ndarray          # (T, M) squared losses
+    bias_paths: np.ndarray      # (T, M) bias paths
+    sigma_paths: np.ndarray     # (T, M) idiosyncratic standard deviations
+    common_shock: np.ndarray    # (T,) common shock path
     config: ScenarioConfig = field(default_factory=ScenarioConfig)
 
 
 def generate_scenario(cfg: ScenarioConfig) -> SimulationData:
-    """Master scenario generator."""
+    """
+    Generate simulated targets, forecasts, errors, and losses from a scenario
+    configuration.
+
+    The generator builds the data in stages:
+
+        1. Construct bias paths `b_{j,t}`
+        2. Construct idiosyncratic scale paths `sigma_{j,t}`
+        3. Draw a common shock shared across forecasters
+        4. Draw idiosyncratic noise, optionally with factor or cluster dependence
+        5. Combine components into forecast errors
+        6. Build the target series and implied forecasts
+
+    Forecast errors follow the sign convention used throughout this file:
+
+        e_{j,t} = c_t - b_{j,t} - u_{j,t}
+
+    where `c_t` is the common shock, `b_{j,t}` is the bias term, and `u_{j,t}`
+    is the idiosyncratic component.
+
+    Args:
+        cfg (ScenarioConfig): Scenario specification
+
+    Returns:
+        SimulationData: Simulated target, forecasts, errors, and metadata
+    """
     rng = _ensure_rng(cfg.seed)
     M, T = cfg.M, cfg.T
 
@@ -824,21 +1014,11 @@ def generate_scenario(cfg: ScenarioConfig) -> SimulationData:
     common = rng.normal(0, cfg.sigma_common, size=T)
 
     # 4. Idiosyncratic errors
-    idio = np.zeros((T, M))
-    for j in range(M):
-        idio[:, j] = rng.normal(0, 1, size=T) * sigma_idio[:, j]
+    idio = rng.normal(0, 1, size=(T, M)) * sigma_idio
 
-    # factor structure
+    # Replace independent idiosyncratic noise by a one-factor structure if requested.
     if cfg.factor_rho is not None:
         factor = rng.normal(0, 1, size=T)
-        for j in range(M):
-            rho_j = cfg.factor_rho[j]
-            idio[:, j] = rho_j * factor + np.sqrt(max(1 - rho_j ** 2, 0)) * idio[:, j]
-            idio[:, j] *= sigma_idio[:, j]  # re-scale? Actually let's be precise
-        # Rewrite: idio should have the desired marginal scale
-        # idio_j = sigma_j * (rho_j * f + sqrt(1-rho_j^2) * u_j)
-        # We've already generated idio[:,j] = N(0,1)*sigma, f = N(0,1)
-        # Let's redo cleanly
         idio_clean = np.zeros((T, M))
         u = rng.normal(0, 1, size=(T, M))
         for j in range(M):
@@ -848,7 +1028,7 @@ def generate_scenario(cfg: ScenarioConfig) -> SimulationData:
             )
         idio = idio_clean
 
-    # Cluster structure (overrides factor_rho if set)
+    # Cluster dependence takes precedence over the global one-factor structure.
     if cfg.n_clusters > 1 and cfg.cluster_labels is not None:
         cluster_factors = rng.normal(0, 1, size=(T, cfg.n_clusters))
         u = rng.normal(0, 1, size=(T, M))
@@ -860,14 +1040,22 @@ def generate_scenario(cfg: ScenarioConfig) -> SimulationData:
                 + np.sqrt(max(1 - rho_c ** 2, 0)) * u[:, j]
             )
 
-    # Outliers
+    # Outliers replace, rather than add to, the baseline idiosyncratic shock.
     if cfg.outlier_prob > 0:
         outlier_mask = rng.random(size=(T, M)) < cfg.outlier_prob
-        outlier_vals = rng.uniform(-cfg.outlier_scale, cfg.outlier_scale, size=(T, M))
+        upper_scale = max(cfg.outlier_scale, cfg.outlier_min_scale)
+        outlier_magnitude = rng.uniform(
+            cfg.outlier_min_scale * sigma_idio,
+            upper_scale * sigma_idio,
+            size=(T, M),
+        )
+        outlier_sign = rng.choice([-1.0, 1.0], size=(T, M))
+        outlier_vals = outlier_sign * outlier_magnitude
         idio = np.where(outlier_mask, outlier_vals, idio)
 
-    # 5. Forecast errors: e_{j,t} = c_t - b_{j,t} - eps_{j,t}
-    # Actually: e = c - b - idio
+    # 5. Forecast errors.
+    # Keep the sign convention used in this file: common shocks enter
+    # positively, while bias and idiosyncratic terms enter negatively.
     errors = common[:, None] - bias - idio  # (T, M)
 
     # 6. Target
@@ -877,7 +1065,7 @@ def generate_scenario(cfg: ScenarioConfig) -> SimulationData:
     y = y_signal + common  # plus common
     forecasts = y[:, None] - errors  # f_{j,t} = y_t - e_{j,t}
 
-    # losses
+    # Losses are computed using squared error throughout the simulation section.
     losses = squared_loss(y[:, None], forecasts)
 
     return SimulationData(
@@ -893,6 +1081,24 @@ def generate_scenario(cfg: ScenarioConfig) -> SimulationData:
 
 
 def _generate_bias(cfg: ScenarioConfig, rng) -> np.ndarray:
+    """
+    Generate the bias paths implied by a scenario configuration.
+
+    Supported bias specifications are:
+
+        - `zero`: no bias
+        - `constant`: fixed bias vector over time
+        - `break`: piecewise-constant bias with one break
+        - `drift`: smoothly evolving bias with a persistent latent slope
+        - `cluster`: constant bias vector intended for grouped forecasters
+        
+    Args:
+        cfg (ScenarioConfig): Scenario specification
+        rng: NumPy random number generator
+
+    Returns:
+        np.ndarray: Bias matrix of shape (T, M)
+    """
     M, T = cfg.M, cfg.T
     bias = np.zeros((T, M))
 
@@ -901,17 +1107,25 @@ def _generate_bias(cfg: ScenarioConfig, rng) -> np.ndarray:
 
     elif cfg.bias_type == "constant":
         if cfg.bias_values is not None:
-            b = cfg.bias_values.copy()
+            b = np.asarray(cfg.bias_values, dtype=float).copy()
         else:
-            b = rng.normal(0, 0.3, size=M)
+            b = rng.uniform(cfg.bias_init_low, cfg.bias_init_high, size=M)
         if cfg.bias_centered:
             b -= b.mean()
         bias = np.tile(b, (T, 1))
 
     elif cfg.bias_type == "break":
-        t_break = cfg.bias_break_time if cfg.bias_break_time else T // 2
-        b_pre = cfg.bias_pre if cfg.bias_pre is not None else rng.normal(0, 0.2, size=M)
-        b_post = cfg.bias_post if cfg.bias_post is not None else rng.normal(0, 0.2, size=M)
+        t_break = cfg.bias_break_time if cfg.bias_break_time is not None else T // 2
+        b_pre = (
+            np.asarray(cfg.bias_pre, dtype=float).copy()
+            if cfg.bias_pre is not None
+            else rng.uniform(cfg.bias_init_low, cfg.bias_init_high, size=M)
+        )
+        b_post = (
+            np.asarray(cfg.bias_post, dtype=float).copy()
+            if cfg.bias_post is not None
+            else rng.uniform(cfg.bias_init_low, cfg.bias_init_high, size=M)
+        )
         if cfg.bias_centered:
             b_pre -= b_pre.mean()
             b_post -= b_post.mean()
@@ -919,17 +1133,21 @@ def _generate_bias(cfg: ScenarioConfig, rng) -> np.ndarray:
         bias[t_break:] = b_post[None, :]
 
     elif cfg.bias_type == "drift":
-        speed = cfg.bias_drift_speed
+        rho = cfg.bias_drift_rho
+        eta = np.sqrt(max(cfg.bias_drift_eta2, EPS)) if cfg.bias_drift_eta2 is not None else max(cfg.bias_drift_speed, EPS)
         b = np.zeros((T, M))
-        b[0] = rng.normal(0, 0.1, size=M)
+        slope = np.zeros((T, M))
+        b[0] = rng.uniform(cfg.bias_init_low, cfg.bias_init_high, size=M)
+        slope[0] = rng.normal(0, eta, size=M)
         for t in range(1, T):
-            b[t] = b[t - 1] + rng.normal(0, speed, size=M)
+            slope[t] = rho * slope[t - 1] + rng.normal(0, eta, size=M)
+            b[t] = b[t - 1] + slope[t]
         if cfg.bias_centered:
             b -= b.mean(axis=1, keepdims=True)
         bias = b
 
     elif cfg.bias_type == "cluster":
-        # same as constant but with cluster structure in biases
+        # This currently behaves like a constant-bias design, not a dynamic cluster process.
         if cfg.bias_values is not None:
             b = cfg.bias_values.copy()
         else:
@@ -942,13 +1160,57 @@ def _generate_bias(cfg: ScenarioConfig, rng) -> np.ndarray:
 
 
 def _generate_sigma(cfg: ScenarioConfig, rng) -> np.ndarray:
+    """
+    Generate idiosyncratic standard-deviation paths for each forecaster.
+
+    The function first respects any explicitly provided `sigma_idio` input. If
+    no fixed path is supplied, it supports either a smooth log-precision drift
+    or a simple piecewise-constant variance shift. If neither is requested, it
+    falls back to a constant default scale.
+
+    Args:
+        cfg (ScenarioConfig): Scenario specification
+        rng: NumPy random number generator
+
+    Returns:
+        np.ndarray: Idiosyncratic standard deviations of shape (T, M)
+    """
     M, T = cfg.M, cfg.T
 
     if cfg.sigma_idio is not None:
-        s = cfg.sigma_idio
+        s = np.asarray(cfg.sigma_idio, dtype=float)
         if s.ndim == 1:
             return np.tile(s, (T, 1))
         return s
+
+    if cfg.sigma_process == "smooth_precision":
+        log_precision = np.zeros((T, M))
+        slope = np.zeros((T, M))
+        precision = np.zeros((T, M))
+
+        eta = np.sqrt(max(cfg.sigma_drift_eta2, EPS))
+        base_precision = 1.0 / max(cfg.base_sigma2, EPS)
+        base_log_precision = np.log(base_precision)
+
+        log_precision[0] = base_log_precision + rng.normal(0, 0.1, size=M)
+        slope[0] = rng.normal(0, eta, size=M)
+        log_precision[0] = np.clip(
+            log_precision[0], cfg.log_precision_min, cfg.log_precision_max
+        )
+        precision[0] = np.exp(log_precision[0])
+
+        for t in range(1, T):
+            slope[t] = (
+                cfg.sigma_drift_rho * slope[t - 1]
+                + rng.normal(0, eta, size=M)
+            )
+            log_precision[t] = log_precision[t - 1] + slope[t]
+            log_precision[t] = np.clip(
+                log_precision[t], cfg.log_precision_min, cfg.log_precision_max
+            )
+            precision[t] = np.exp(log_precision[t])
+
+        return np.sqrt(1.0 / np.maximum(precision, EPS))  # Convert precision back to sigma
 
     base = np.ones(M) * 0.5
 
@@ -964,40 +1226,87 @@ def _generate_sigma(cfg: ScenarioConfig, rng) -> np.ndarray:
 
 
 # ===================================================================
-# 7b.  PRE-BUILT SCENARIO FACTORIES
+# 7b.  PRE-BUILT SCENARIOS
 # ===================================================================
 
 def scenario_1A(M=8, T=400, T0=200, seed=42) -> ScenarioConfig:
-    """Stable unbiased homoskedastic."""
+    """
+    Generate a stable benchmark scenario with unbiased, homoskedastic forecasts.
+
+    All forecasters have zero bias over time and a constant idiosyncratic
+    standard deviation of 1.0. Cross-sectional comovement is introduced only
+    through a common shock with standard deviation `sigma_common = 0.5`.
+
+    Args:
+        M (int): Number of forecasters
+        T (int): Number of time steps
+        T0 (int): Start of the out-of-sample evaluation period
+        seed (int): Random seed used in the simulation
+
+    Returns:
+        ScenarioConfig: Configuration for scenario 1A
+    """
     return ScenarioConfig(
         name="1A_stable_unbiased",
         M=M, T=T, T0=T0, seed=seed,
         sigma_common=0.5,
         bias_type="zero",
-        sigma_idio=np.ones(M) * 0.5,
+        sigma_idio=np.ones(M) * 1.0,
     )
 
 
 def scenario_1B(M=8, T=400, T0=200, seed=42) -> ScenarioConfig:
-    """Stable biased homoskedastic (centered)."""
+    """
+    Generate a stable scenario with constant forecaster-specific biases.
+
+    Each forecaster receives a time-invariant bias drawn uniformly from
+    `[0, 1]`, with constant idiosyncratic standard deviation 1.0. The error
+    variance is otherwise stable over time and includes a common shock with
+    standard deviation `sigma_common = 0.5`.
+
+    Args:
+        M (int): Number of forecasters
+        T (int): Number of time steps
+        T0 (int): Start of the out-of-sample evaluation period
+        seed (int): Random seed used to generate the bias vector
+
+    Returns:
+        ScenarioConfig: Configuration for scenario 1B
+    """
     rng = _ensure_rng(seed)
-    biases = rng.normal(0, 0.4, size=M)
+    biases = rng.uniform(0.0, 1.0, size=M)
     return ScenarioConfig(
         name="1B_stable_biased",
         M=M, T=T, T0=T0, seed=seed,
         sigma_common=0.5,
         bias_type="constant",
         bias_values=biases,
-        bias_centered=True,
-        sigma_idio=np.ones(M) * 0.5,
+        bias_centered=False,
+        sigma_idio=np.ones(M) * 1.0,
     )
 
 
 def scenario_2A(M=8, T=400, T0=200, seed=42, break_frac=0.5) -> ScenarioConfig:
-    """Abrupt break in biases."""
+    """
+    Generate a scenario with an abrupt structural break in forecaster biases.
+
+    Biases are constant up to time `t_break = floor(T * break_frac)` and then
+    switch instantaneously to a new independently drawn bias vector. The
+    idiosyncratic standard deviation remains constant at 1.0 throughout.
+
+    Args:
+        M (int): Number of forecasters
+        T (int): Number of time steps
+        T0 (int): Start of the out-of-sample evaluation period
+        seed (int): Random seed used in the simulation
+        break_frac (float): Fraction of the sample at which the bias break occurs
+
+    Returns:
+        ScenarioConfig: Configuration for scenario 2A
+    """
     rng = _ensure_rng(seed + 1)
-    b_pre = rng.normal(0, 0.3, size=M)
-    b_post = rng.normal(0, 0.3, size=M)
+    b_pre = rng.uniform(0.0, 1.0, size=M)
+    b_post = rng.uniform(0.0, 1.0, size=M)
     t_break = int(T * break_frac)
     return ScenarioConfig(
         name="2A_abrupt_break",
@@ -1007,70 +1316,157 @@ def scenario_2A(M=8, T=400, T0=200, seed=42, break_frac=0.5) -> ScenarioConfig:
         bias_break_time=t_break,
         bias_pre=b_pre,
         bias_post=b_post,
-        bias_centered=True,
-        sigma_idio=np.ones(M) * 0.5,
+        bias_centered=False,
+        sigma_idio=np.ones(M) * 1.0,
     )
 
 
 def scenario_2B(M=8, T=400, T0=200, seed=42) -> ScenarioConfig:
-    """Smooth drift in biases."""
+    """
+    Generate a scenario with smoothly drifting forecaster biases.
+
+    Biases evolve over time through a latent slope process with persistence
+    `bias_drift_rho = 0.95` and innovation scale `sqrt(5e-4)`. This creates
+    gradual nonstationarity in forecast bias while idiosyncratic volatility
+    remains constant across forecasters and time.
+
+    Args:
+        M (int): Number of forecasters
+        T (int): Number of time steps
+        T0 (int): Start of the out-of-sample evaluation period
+        seed (int): Random seed used in the simulation
+
+    Returns:
+        ScenarioConfig: Configuration for scenario 2B
+    """
     return ScenarioConfig(
         name="2B_smooth_drift",
         M=M, T=T, T0=T0, seed=seed,
         sigma_common=0.5,
         bias_type="drift",
-        bias_drift_speed=0.02,
-        bias_centered=True,
-        sigma_idio=np.ones(M) * 0.5,
+        bias_drift_speed=float(np.sqrt(5e-4)),
+        bias_drift_rho=0.95,
+        bias_centered=False,
+        bias_init_low=0.0,
+        bias_init_high=1.0,
+        sigma_idio=np.ones(M) * 1.0,
     )
 
 
 def scenario_2C(M=8, T=400, T0=200, seed=42) -> ScenarioConfig:
-    """Precision shift (variance change)."""
-    t_shift = T // 2
-    sigma_pre = np.ones(M) * 0.5
-    sigma_post = np.ones(M) * 0.5
-    sigma_post[:M // 2] = 1.5  # first half become noisy
+    """
+    Generate a scenario with smooth drift in forecaster precision.
+
+    Forecasts remain unbiased, but each forecaster's idiosyncratic variance
+    changes over time through a persistent log-precision process. Precision is
+    clipped to the interval defined by `log_precision_min` and
+    `log_precision_max`, creating gradual heteroskedasticity without bias drift.
+
+    Args:
+        M (int): Number of forecasters
+        T (int): Number of time steps
+        T0 (int): Start of the out-of-sample evaluation period
+        seed (int): Random seed used in the simulation
+
+    Returns:
+        ScenarioConfig: Configuration for scenario 2C
+    """
     return ScenarioConfig(
         name="2C_precision_shift",
         M=M, T=T, T0=T0, seed=seed,
         sigma_common=0.5,
         bias_type="zero",
-        sigma_shift_time=t_shift,
-        sigma_pre=sigma_pre,
-        sigma_post=sigma_post,
+        sigma_process="smooth_precision",
+        base_sigma2=1.0,
+        sigma_drift_rho=0.95,
+        sigma_drift_eta2=8e-4,
+        log_precision_min=-2.0,
+        log_precision_max=2.0,
     )
 
 
 def scenario_3A(M=8, T=400, T0=200, seed=42) -> ScenarioConfig:
-    """Idiosyncratic outliers."""
+    """
+    Generate a scenario with occasional idiosyncratic forecast outliers.
+
+    Forecasts are unbiased with constant baseline volatility, but each
+    forecaster-period pair is replaced by an outlier with probability 0.05.
+    Outlier magnitudes are drawn uniformly between 2 and 6 times the local
+    idiosyncratic scale, with random sign.
+
+    Args:
+        M (int): Number of forecasters
+        T (int): Number of time steps
+        T0 (int): Start of the out-of-sample evaluation period
+        seed (int): Random seed used in the simulation
+
+    Returns:
+        ScenarioConfig: Configuration for scenario 3A
+    """
     return ScenarioConfig(
         name="3A_outliers",
         M=M, T=T, T0=T0, seed=seed,
         sigma_common=0.5,
         bias_type="zero",
-        sigma_idio=np.ones(M) * 0.5,
+        sigma_idio=np.ones(M) * 1.0,
         outlier_prob=0.05,
-        outlier_scale=5.0,
+        outlier_scale=6.0,
+        outlier_min_scale=2.0,
     )
 
 
 def scenario_3B(M=8, T=400, T0=200, seed=42) -> ScenarioConfig:
-    """Cross-sectional one-factor dependence."""
-    rng = _ensure_rng(seed + 2)
+    """
+    Generate unbiased forecast errors with cross-sectional dependence through
+    a one-factor structure:
+
+        e_{i,t} = rho_i * f_t + sqrt(1 - rho_i^2) * u_{i,t}
+
+    where `f_t` is a common latent factor, `u_{i,t}` is an idiosyncratic shock,
+    and both components are scaled by the forecaster-specific idiosyncratic
+    standard deviation. Factor loadings `rho_i` are drawn uniformly from
+    `[0.3, 0.9]`.
+
+    Args:
+        M (int): Number of forecasters
+        T (int): Number of time steps
+        T0 (int): Start of the out-of-sample evaluation period
+        seed (int): Random seed used to generate the factor loadings
+
+    Returns:
+        ScenarioConfig: Configuration for scenario 3B
+    """
+    rng = _ensure_rng(seed)
     rhos = rng.uniform(0.3, 0.9, size=M)
     return ScenarioConfig(
         name="3B_factor_dependence",
         M=M, T=T, T0=T0, seed=seed,
         sigma_common=0.5,
         bias_type="zero",
-        sigma_idio=np.ones(M) * 0.5,
+        sigma_idio=np.ones(M) * 1.0,
         factor_rho=rhos,
     )
 
 
 def scenario_3C(M=8, T=400, T0=200, seed=42) -> ScenarioConfig:
-    """Clustered forecasters."""
+    """
+    Generate unbiased forecast errors with clustered cross-sectional dependence.
+
+    Forecasters are assigned deterministically to three clusters. Within each
+    cluster, errors load on a shared cluster-level factor with loading
+    `cluster_rho = 0.7`, while the remaining variation is idiosyncratic.
+    Baseline idiosyncratic volatility is constant over time and across
+    forecasters.
+
+    Args:
+        M (int): Number of forecasters
+        T (int): Number of time steps
+        T0 (int): Start of the out-of-sample evaluation period
+        seed (int): Random seed used in the simulation
+
+    Returns:
+        ScenarioConfig: Configuration for scenario 3C
+    """
     n_clusters = 3
     labels = np.array([i % n_clusters for i in range(M)])
     return ScenarioConfig(
@@ -1078,7 +1474,7 @@ def scenario_3C(M=8, T=400, T0=200, seed=42) -> ScenarioConfig:
         M=M, T=T, T0=T0, seed=seed,
         sigma_common=0.5,
         bias_type="zero",
-        sigma_idio=np.ones(M) * 0.5,
+        sigma_idio=np.ones(M) * 1.0,
         n_clusters=n_clusters,
         cluster_labels=labels,
         cluster_rho=0.7,
@@ -1446,7 +1842,13 @@ def _tune_alpha_gamma(
 
 @dataclass
 class MCResult:
-    """Summary of Monte Carlo replications."""
+    """
+    Store Monte Carlo performance summaries for one simulation scenario.
+
+    The object collects replication-level mean losses, relative losses versus
+    equal weights, and aggregate win frequencies across all combination
+    methods evaluated in the backtest.
+    """
     scenario_name: str
     n_reps: int
     method_names: List[str]
@@ -1465,7 +1867,25 @@ def run_monte_carlo(
     verbose: bool = False,
     **scenario_kwargs,
 ) -> MCResult:
-    """Run repeated replications of a scenario."""
+    """
+    Run repeated Monte Carlo replications for a single scenario design.
+
+    For each replication, the scenario is regenerated with a shifted random
+    seed, the rolling backtest is executed, and mean out-of-sample losses are
+    collected for all methods. The function then aggregates those replication-
+    level results into one `MCResult`.
+
+    Args:
+        scenario_factory (Callable): Scenario constructor such as `scenario_1A`
+            or `scenario_2B`
+        n_reps (int): Number of Monte Carlo replications
+        bt_cfg (BacktestConfig | None): Backtest configuration used in each run
+        verbose (bool): Whether to print replication progress
+        **scenario_kwargs: Keyword arguments forwarded to `scenario_factory`
+
+    Returns:
+        MCResult: Aggregated Monte Carlo summary for the scenario
+    """
     if bt_cfg is None:
         bt_cfg = BacktestConfig()
 
@@ -1498,7 +1918,7 @@ def run_monte_carlo(
     winners = msfe_mat.argmin(axis=1)
     for w in winners:
         win_freq[w] += 1
-        win_freq /= n_reps
+    win_freq /= n_reps
 
     return MCResult(
         scenario_name=cfg.name,
@@ -1514,7 +1934,15 @@ def run_monte_carlo(
 
 
 def summarise_mc(mc: MCResult) -> pd.DataFrame:
-    """Pretty-print Monte Carlo summary as DataFrame."""
+    """
+    Convert a Monte Carlo result object into a tidy summary table.
+
+    Args:
+        mc (MCResult): Monte Carlo output from `run_monte_carlo`
+
+    Returns:
+        pd.DataFrame: Method-level summary sorted by mean MSFE
+    """
     df = pd.DataFrame({
         "Method": mc.method_names,
         "Mean_MSFE": mc.mean_msfe,
@@ -1985,7 +2413,1398 @@ def plot_mc_heatmap(mc_results: Dict[str, MCResult]):
 
 
 # ===================================================================
-# 11.  LEAKAGE AUDIT UTILITIES
+# 11.  MCS, ADAPTABILITY
+# ===================================================================
+
+@dataclass
+class MCSResult:
+    """
+    Store outputs from one Hansen-style Model Confidence Set procedure.
+
+    The object keeps the surviving set, elimination path, bootstrap p-values,
+    and a convenient summary table for downstream reporting and plotting.
+    """
+    alpha: float
+    statistic: str
+    B: int
+    block_size: int
+    model_names: List[str]
+    included_models: List[str]
+    elimination_order: List[str]
+    pvalues: Dict[str, float]
+    elimination_steps: Dict[str, int]
+    test_statistics: List[float]
+    test_pvalues: List[float]
+    active_sets: List[List[str]]
+    mean_losses: Dict[str, float]
+    summary_table: pd.DataFrame = field(default_factory=pd.DataFrame)
+
+
+def _coerce_loss_matrix(
+    losses: Union[BacktestResult, pd.DataFrame, np.ndarray],
+    model_names: Optional[Sequence[str]] = None,
+    methods: Optional[Sequence[str]] = None,
+) -> Tuple[np.ndarray, List[str]]:
+    """
+    Extract a `T x M` loss matrix and aligned model names from supported inputs.
+
+    Args:
+        losses (BacktestResult | pd.DataFrame | np.ndarray): Loss input in one
+            of the supported container formats
+        model_names (Sequence[str] | None): Optional model names for array input
+        methods (Sequence[str] | None): Optional subset of methods when the
+            input is a `BacktestResult`
+
+    Returns:
+        Tuple[np.ndarray, List[str]]: Loss matrix and associated model names
+    """
+    if isinstance(losses, BacktestResult):
+        if methods is None:
+            methods = list(losses.combined_losses.keys())
+        arr = np.column_stack([np.asarray(losses.combined_losses[m], dtype=float) for m in methods])
+        return arr, list(methods)
+    if isinstance(losses, pd.DataFrame):
+        return losses.to_numpy(dtype=float), list(losses.columns.astype(str))
+    arr = np.asarray(losses, dtype=float)
+    if arr.ndim != 2:
+        raise ValueError("losses must be a 2D array, DataFrame, or BacktestResult")
+    if model_names is None:
+        model_names = [f"model_{i+1}" for i in range(arr.shape[1])]
+    if len(model_names) != arr.shape[1]:
+        raise ValueError("model_names length must match the number of columns in losses")
+    return arr, list(model_names)
+
+
+# ---------- Block-size heuristics ----------
+
+def _select_ar_order_bic(series: np.ndarray, max_lags: int = 10) -> int:
+    """
+    Select a univariate AR order with a simple BIC criterion.
+
+    Args:
+        series (np.ndarray): Univariate time series
+        max_lags (int): Maximum AR order considered
+
+    Returns:
+        int: BIC-selected lag order
+    """
+    x = np.asarray(series, dtype=float)
+    n = len(x)
+    max_lags = min(max_lags, max(n // 3, 0))
+    if n < 8 or max_lags == 0:
+        return 0
+
+    best_p = 0
+    best_bic = np.inf
+    for p in range(max_lags + 1):
+        if n <= p + 2:
+            continue
+        y = x[p:]
+        X = np.ones((n - p, p + 1))
+        for lag in range(1, p + 1):
+            X[:, lag] = x[p - lag:n - lag]
+        beta, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+        resid = y - X @ beta
+        sigma2 = np.mean(resid ** 2)
+        bic = np.log(max(sigma2, EPS)) + (p + 1) * np.log(len(y)) / len(y)
+        if bic < best_bic:
+            best_bic = bic
+            best_p = p
+    return best_p
+
+
+def _auto_mcs_block_size(
+    loss_matrix: np.ndarray,
+    min_block_size: int = 3,
+    max_lags: int = 10,
+) -> int:
+    """
+    Practical block-length heuristic for the MCS bootstrap.
+
+    Uses the maximum BIC-selected AR order across pairwise loss differentials,
+    with a minimum floor for numerical stability.
+    """
+    n, m = loss_matrix.shape
+    if n < 10 or m < 2:
+        return min_block_size
+    orders = []
+    for i in range(m):
+        for j in range(i + 1, m):
+            diff = loss_matrix[:, i] - loss_matrix[:, j]
+            if np.allclose(diff, diff[0]):
+                continue
+            orders.append(_select_ar_order_bic(diff, max_lags=max_lags))
+    if not orders:
+        return min_block_size
+    block_size = max(max(orders), min_block_size)
+    return int(min(block_size, max(n // 2, min_block_size)))
+
+
+# ---------- Bootstrap utilities ----------
+
+def _moving_block_bootstrap_indices(
+    n_obs: int,
+    B: int,
+    block_size: int,
+    rng,
+) -> np.ndarray:
+    """
+    Generate circular moving-block bootstrap indices.
+
+    Args:
+        n_obs (int): Number of time observations
+        B (int): Number of bootstrap replications
+        block_size (int): Length of each resampled block
+        rng: NumPy random number generator
+
+    Returns:
+        np.ndarray: Bootstrap index array of shape `(B, n_obs)`
+    """
+    n_blocks = int(np.ceil(n_obs / max(block_size, 1)))
+    starts = rng.integers(0, n_obs, size=(B, n_blocks))
+    offsets = np.arange(block_size)
+    indices = (starts[:, :, None] + offsets[None, None, :]) % n_obs
+    return indices.reshape(B, -1)[:, :n_obs]
+
+
+# ---------- One-step MCS statistics ----------
+
+def _mcs_iteration_statistics(
+    loss_matrix: np.ndarray,
+    bootstrap_indices: np.ndarray,
+    statistic: str,
+) -> Dict[str, Union[float, int, bool]]:
+    """
+    Compute one MCS test statistic, bootstrap p-value, and elimination rule.
+
+    Args:
+        loss_matrix (np.ndarray): Active-model loss matrix of shape `(T, M)`
+        bootstrap_indices (np.ndarray): Bootstrap resampling indices
+        statistic (str): Either `"Tmax"` or `"TR"`
+
+    Returns:
+        Dict[str, Union[float, int, bool]]: Test statistic, p-value, index of
+        the model to eliminate, and a flag for degenerate equal-loss cases
+    """
+    n_obs, m = loss_matrix.shape
+    loss_means = loss_matrix.mean(axis=0)
+    boot_means = loss_matrix[bootstrap_indices].mean(axis=1)  # (B, m)
+    zeta = boot_means - loss_means[None, :]
+
+    scale = m / max(m - 1, 1)
+    d_i_mean = scale * (loss_means - loss_means.mean())
+    d_i_boot_centered = scale * (zeta - zeta.mean(axis=1, keepdims=True))
+    var_i = np.mean(d_i_boot_centered ** 2, axis=0)
+    t_i = d_i_mean / np.sqrt(var_i + EPS)
+    T_max = float(np.max(t_i))
+    T_max_star = np.max(d_i_boot_centered / np.sqrt(var_i + EPS), axis=1)
+    p_max = float(np.mean(T_max_star >= (T_max - EPS)))
+    elim_tmax = int(np.argmax(t_i))
+
+    pair_centered = zeta[:, :, None] - zeta[:, None, :]
+    d_ij_mean = loss_means[:, None] - loss_means[None, :]
+    var_ij = np.mean(pair_centered ** 2, axis=0)
+    np.fill_diagonal(var_ij, np.nan)
+    t_ij = d_ij_mean / np.sqrt(var_ij + EPS)
+    T_r = float(np.nanmax(np.abs(t_ij)))
+    T_r_star = np.nanmax(
+        np.abs(pair_centered / np.sqrt(var_ij[None, :, :] + EPS)),
+        axis=(1, 2),
+    )
+    p_r = float(np.mean(T_r_star >= (T_r - EPS)))
+    v_i_r = np.nanmax(t_ij, axis=1)
+    elim_tr = int(np.nanargmax(v_i_r))
+
+    if statistic == "TR":
+        return {
+            "test_stat": T_r,
+            "pvalue": p_r,
+            "eliminate_idx": elim_tr,
+            "all_equal": bool(np.all(np.isnan(var_ij)) or np.nanmax(var_ij) < EPS),
+        }
+    return {
+        "test_stat": T_max,
+        "pvalue": p_max,
+        "eliminate_idx": elim_tmax,
+        "all_equal": bool(np.max(var_i) < EPS),
+    }
+
+
+# ---------- Hansen-style MCS procedure ----------
+
+def model_confidence_set(
+    losses: Union[BacktestResult, pd.DataFrame, np.ndarray],
+    model_names: Optional[Sequence[str]] = None,
+    methods: Optional[Sequence[str]] = None,
+    alpha: float = 0.10,
+    B: int = 500,
+    statistic: Literal["Tmax", "TR"] = "Tmax",
+    block_size: Optional[int] = None,
+    min_block_size: int = 3,
+    seed: Optional[Union[int, np.random.Generator]] = None,
+) -> MCSResult:
+    """
+    Hansen-Lunde-Nason Model Confidence Set procedure.
+
+    Parameters
+    ----------
+    losses
+        Either a `BacktestResult`, a T x M DataFrame of losses, or a T x M array.
+    statistic
+        Either "Tmax" or "TR", matching Hansen et al. (2011).
+
+    Returns
+    -------
+    MCSResult
+        Full Model Confidence Set output, including the surviving model set and
+        elimination summary.
+    """
+    if statistic not in {"Tmax", "TR"}:
+        raise ValueError("statistic must be either 'Tmax' or 'TR'")
+
+    loss_matrix, model_names = _coerce_loss_matrix(losses, model_names, methods)
+    n_obs, n_models = loss_matrix.shape
+    if n_models < 2:
+        raise ValueError("MCS requires at least two models")
+
+    if block_size is None:
+        block_size = _auto_mcs_block_size(loss_matrix, min_block_size=min_block_size)
+    block_size = max(int(block_size), 1)
+
+    rng = _ensure_rng(seed)
+    bootstrap_indices = _moving_block_bootstrap_indices(n_obs, int(B), block_size, rng)
+
+    mean_losses = {name: float(loss_matrix[:, i].mean()) for i, name in enumerate(model_names)}
+    active = list(range(n_models))
+    elimination_order: List[str] = []
+    elimination_steps: Dict[str, int] = {}
+    pvalues: Dict[str, float] = {}
+    test_statistics: List[float] = []
+    test_pvalues: List[float] = []
+    active_sets: List[List[str]] = []
+    running_p = 0.0
+
+    while len(active) > 1:
+        active_sets.append([model_names[i] for i in active])
+        stats = _mcs_iteration_statistics(loss_matrix[:, active], bootstrap_indices, statistic)
+        test_statistics.append(float(stats["test_stat"]))
+        test_pvalues.append(float(stats["pvalue"]))
+
+        if stats["all_equal"] or stats["pvalue"] >= alpha:
+            break
+
+        local_idx = int(stats["eliminate_idx"])
+        global_idx = active[local_idx]
+        name = model_names[global_idx]
+        running_p = max(running_p, float(stats["pvalue"]))
+        elimination_order.append(name)
+        elimination_steps[name] = len(elimination_order)
+        pvalues[name] = running_p
+        active.pop(local_idx)
+
+    included_models = [model_names[i] for i in active]
+    for name in included_models:
+        elimination_steps[name] = 0
+        pvalues[name] = 1.0
+
+    summary_rows = []
+    for name in model_names:
+        summary_rows.append({
+            "Method": name,
+            "Mean_Loss": mean_losses[name],
+            "MCS_pvalue": pvalues[name],
+            "In_MCS": name in included_models,
+            "Elimination_Step": elimination_steps[name],
+        })
+    summary_table = pd.DataFrame(summary_rows).sort_values(
+        ["In_MCS", "Mean_Loss"],
+        ascending=[False, True],
+    ).reset_index(drop=True)
+
+    return MCSResult(
+        alpha=float(alpha),
+        statistic=statistic,
+        B=int(B),
+        block_size=block_size,
+        model_names=model_names,
+        included_models=included_models,
+        elimination_order=elimination_order,
+        pvalues=pvalues,
+        elimination_steps=elimination_steps,
+        test_statistics=test_statistics,
+        test_pvalues=test_pvalues,
+        active_sets=active_sets,
+        mean_losses=mean_losses,
+        summary_table=summary_table,
+    )
+
+
+# ---------- MCS reporting helpers ----------
+
+def compute_mcs_performance_table(
+    res: BacktestResult,
+    mcs_result: Optional[MCSResult] = None,
+    methods: Optional[Sequence[str]] = None,
+    reference: str = "equal",
+    **mcs_kwargs,
+) -> pd.DataFrame:
+    """
+    Merge standard backtest performance metrics with MCS diagnostics.
+
+    Args:
+        res (BacktestResult): Rolling backtest output
+        mcs_result (MCSResult | None): Precomputed MCS result, if available
+        methods (Sequence[str] | None): Optional method subset
+        reference (str): Reference method used to rescale mean losses
+        **mcs_kwargs: Extra keyword arguments passed to `model_confidence_set`
+
+    Returns:
+        pd.DataFrame: Performance table augmented with MCS status columns
+    """
+    perf = compute_performance_table(res)
+    if methods is not None:
+        perf = perf[perf["Method"].isin(methods)].copy()
+    if mcs_result is None:
+        mcs_result = model_confidence_set(res, methods=methods, **mcs_kwargs)
+    mcs_tbl = mcs_result.summary_table[["Method", "MCS_pvalue", "In_MCS", "Elimination_Step"]]
+    df = perf.merge(mcs_tbl, on="Method", how="left")
+
+    if reference in df["Method"].values:
+        ref_loss = df.loc[df["Method"] == reference, "Mean_Loss"].iloc[0]
+        df["Rel_MSFE"] = df["Mean_Loss"] / (ref_loss + EPS)
+
+    df = df.sort_values(["In_MCS", "Mean_Loss"], ascending=[False, True]).reset_index(drop=True)
+    return df
+
+
+# ---------- MCS visualization ----------
+
+def plot_mcs_summary(
+    res: BacktestResult,
+    mcs_result: Optional[MCSResult] = None,
+    methods: Optional[Sequence[str]] = None,
+    reference: str = "equal",
+    ax=None,
+    **mcs_kwargs,
+):
+    """
+    Plot relative mean loss by method with MCS membership highlighted.
+
+    Args:
+        res (BacktestResult): Rolling backtest output
+        mcs_result (MCSResult | None): Optional precomputed MCS result
+        methods (Sequence[str] | None): Optional method subset
+        reference (str): Reference method for relative MSFE scaling
+        ax: Optional matplotlib axes
+        **mcs_kwargs: Extra keyword arguments passed to `model_confidence_set`
+
+    Returns:
+        matplotlib.figure.Figure: Figure containing the summary bar plot
+    """
+    df = compute_mcs_performance_table(
+        res,
+        mcs_result=mcs_result,
+        methods=methods,
+        reference=reference,
+        **mcs_kwargs,
+    )
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(11, 5))
+    else:
+        fig = ax.figure
+
+    colors = ["darkred" if keep else "steelblue" for keep in df["In_MCS"]]
+    ax.barh(df["Method"], df["Rel_MSFE"], color=colors, alpha=0.85)
+    ax.axvline(1.0, color="black", ls="--", linewidth=0.8)
+    for y, (_, row) in enumerate(df.iterrows()):
+        ax.text(
+            row["Rel_MSFE"] + 0.01,
+            y,
+            f"p={row['MCS_pvalue']:.3f}",
+            va="center",
+            fontsize=8,
+        )
+    ax.set_xlabel(f"Relative MSFE (vs {reference})")
+    ax.set_title("Model Confidence Set Summary")
+    ax.invert_yaxis()
+    fig.tight_layout()
+    return fig
+
+
+# ---------- Adaptability result container ----------
+
+@dataclass
+class AdaptabilityResult:
+    """
+    Store event-study diagnostics for post-switch forecast adaptability.
+
+    The object tracks how quickly each method approaches the latent oracle
+    combination after oracle switches in the simulated environment.
+    """
+    methods: List[str]
+    event_times: np.ndarray
+    oracle_models: np.ndarray
+    horizon: int
+    smooth_window: int
+    target_oracle_weight: float
+    oracle_portfolio_weights: np.ndarray
+    oracle_weight_profiles: Dict[str, np.ndarray]
+    oracle_gap_profiles: Dict[str, np.ndarray]
+    latent_risk_profiles: Dict[str, np.ndarray]
+    excess_risk_profiles: Dict[str, np.ndarray]
+    relative_gap_profiles: Dict[str, np.ndarray]
+    half_lives: Dict[str, np.ndarray]
+    recovery_delays: Dict[str, np.ndarray]
+    summary_table: pd.DataFrame = field(default_factory=pd.DataFrame)
+
+
+# ---------- Latent oracle identification ----------
+
+def compute_latent_oracle_indices(data: SimulationData) -> np.ndarray:
+    """
+    Latent oracle under squared loss.
+
+    Common shocks are shared across models, so ranking is driven by model-specific
+    squared bias plus model-specific idiosyncratic variance.
+    """
+    latent_risk = data.bias_paths ** 2 + data.sigma_paths ** 2
+    return np.argmin(latent_risk, axis=1)
+
+
+def identify_oracle_switches(
+    data: SimulationData,
+    start_time: Optional[int] = None,
+    min_spacing: int = 1,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Identify OOS dates where the latent oracle model changes."""
+    oracle = compute_latent_oracle_indices(data)
+    if start_time is None:
+        start_time = data.config.T0
+    switches = np.where(oracle[1:] != oracle[:-1])[0] + 1
+    switches = switches[switches >= start_time]
+    if len(switches) <= 1 or min_spacing <= 1:
+        return switches, oracle
+
+    keep = [switches[0]]
+    for t in switches[1:]:
+        if t - keep[-1] >= min_spacing:
+            keep.append(t)
+    return np.asarray(keep, dtype=int), oracle
+
+
+# ---------- Adaptability helper functions ----------
+
+def _rolling_mean_1d(x: np.ndarray, window: int) -> np.ndarray:
+    """Rolling mean with min_periods=1."""
+    return pd.Series(np.asarray(x, dtype=float)).rolling(window, min_periods=1).mean().to_numpy()
+
+
+def _latent_variance_scale_with_outliers(cfg: ScenarioConfig) -> float:
+    """Variance inflation factor for the outlier mixture used in scenario generation."""
+    if cfg.outlier_prob <= 0:
+        return 1.0
+    a = float(cfg.outlier_min_scale)
+    b = float(max(cfg.outlier_scale, cfg.outlier_min_scale))
+    uniform_second_moment = (a ** 2 + a * b + b ** 2) / 3.0
+    return (1.0 - cfg.outlier_prob) + cfg.outlier_prob * uniform_second_moment
+
+
+def latent_idiosyncratic_covariance(
+    data: SimulationData,
+    t: int,
+) -> np.ndarray:
+    """
+    Conditional covariance of idiosyncratic forecast errors at time t.
+
+    The common shock is omitted because it is shared across all methods and
+    therefore does not affect cross-method comparisons.
+    """
+    cfg = data.config
+    sigma_t = np.asarray(data.sigma_paths[t], dtype=float)
+    variances = sigma_t ** 2
+
+    if cfg.outlier_prob > 0:
+        variances = variances * _latent_variance_scale_with_outliers(cfg)
+
+    M = len(sigma_t)
+    Sigma = np.diag(variances)
+
+    if cfg.factor_rho is not None:
+        rho = np.asarray(cfg.factor_rho, dtype=float)
+        Sigma = np.outer(sigma_t * rho, sigma_t * rho)
+        np.fill_diagonal(Sigma, variances)
+        return Sigma
+
+    if cfg.n_clusters > 1 and cfg.cluster_labels is not None:
+        labels = np.asarray(cfg.cluster_labels)
+        rho_sq = float(cfg.cluster_rho) ** 2
+        Sigma = np.diag(variances)
+        for i in range(M):
+            for j in range(i + 1, M):
+                if labels[i] == labels[j]:
+                    cov_ij = rho_sq * sigma_t[i] * sigma_t[j]
+                    Sigma[i, j] = cov_ij
+                    Sigma[j, i] = cov_ij
+        return Sigma
+
+    return Sigma
+
+
+def latent_risk_matrix(
+    data: SimulationData,
+    t: int,
+) -> np.ndarray:
+    """
+    Quadratic-form matrix for latent expected squared forecast error at time t.
+
+    For a simplex weight vector w, the method-specific component of expected
+    squared error is:
+        (w'b_t)^2 + w' Sigma_t w
+    where b_t is the latent bias vector and Sigma_t is the conditional
+    idiosyncratic covariance matrix.
+    """
+    bias_t = np.asarray(data.bias_paths[t], dtype=float)
+    Sigma_t = latent_idiosyncratic_covariance(data, t)
+    return Sigma_t + np.outer(bias_t, bias_t)
+
+
+def compute_latent_oracle_combination_weights(
+    data: SimulationData,
+    ridge: float = RIDGE_COV,
+) -> np.ndarray:
+    """Time-varying oracle simplex weights under latent expected squared error."""
+    T = data.config.T
+    M = data.config.M
+    oracle_w = np.zeros((T, M))
+    for t in range(T):
+        G_t = latent_risk_matrix(data, t)
+        oracle_w[t] = covariance_only_weights(G_t, ridge=ridge)
+    return oracle_w
+
+
+def latent_combination_risk(
+    data: SimulationData,
+    weights: np.ndarray,
+    t: int,
+) -> float:
+    """Latent expected squared forecast error for a given weight vector at time t."""
+    G_t = latent_risk_matrix(data, t)
+    w = simplex_project(np.asarray(weights, dtype=float))
+    return float(w @ G_t @ w)
+
+
+def _safe_nanmean(x: np.ndarray) -> float:
+    """NaN-safe mean that returns NaN when no finite values exist."""
+    x = np.asarray(x, dtype=float)
+    finite = np.isfinite(x)
+    if not np.any(finite):
+        return float(np.nan)
+    return float(np.mean(x[finite]))
+
+
+def _safe_nanmedian(x: np.ndarray) -> float:
+    """NaN-safe median that returns NaN when no finite values exist."""
+    x = np.asarray(x, dtype=float)
+    finite = np.isfinite(x)
+    if not np.any(finite):
+        return float(np.nan)
+    return float(np.median(x[finite]))
+
+
+# ---------- Adaptability event-study diagnostic ----------
+
+def compute_adaptability_diagnostics(
+    data: SimulationData,
+    res: BacktestResult,
+    methods: Optional[Sequence[str]] = None,
+    horizon: int = 40,
+    smooth_window: int = 5,
+    min_event_spacing: int = 3,
+    target_oracle_weight: float = 0.8,
+) -> AdaptabilityResult:
+    """
+    Compute simulation-based adaptability diagnostics after latent oracle switches.
+
+    The metric is an original event-study summary inspired by the forecast-breakdown
+    literature: after each latent oracle switch, track how quickly a method
+    closes its excess latent risk relative to the time-varying oracle
+    combination and record the half-life of that gap.
+
+    Args:
+        data (SimulationData): Simulated data-generating environment
+        res (BacktestResult): Backtest output containing time-varying weights
+        methods (Sequence[str] | None): Optional method subset to evaluate
+        horizon (int): Post-switch evaluation horizon
+        smooth_window (int): Rolling window used to smooth relative gap profiles
+        min_event_spacing (int): Minimum spacing between retained switch events
+        target_oracle_weight (float): Oracle-overlap target used for recovery delays
+
+    Returns:
+        AdaptabilityResult: Event-study profiles and summary metrics by method
+    """
+    if methods is None:
+        methods = [m for m in res.weights.keys() if m != "median"]
+    methods = [m for m in methods if m in res.weights]
+
+    event_times, oracle = identify_oracle_switches(
+        data,
+        start_time=data.config.T0,
+        min_spacing=min_event_spacing,
+    )
+    n_events = len(event_times)
+    oracle_models = oracle[event_times] if n_events else np.array([], dtype=int)
+    oracle_combo_weights = compute_latent_oracle_combination_weights(data)
+
+    overlap_profiles = {
+        method: np.full((n_events, horizon), np.nan)
+        for method in methods
+    }
+    weight_profiles = {
+        method: np.full((n_events, horizon), np.nan)
+        for method in methods
+    }
+    gap_profiles = {
+        method: np.full((n_events, horizon), np.nan)
+        for method in methods
+    }
+    latent_risk_profiles = {
+        method: np.full((n_events, horizon), np.nan)
+        for method in methods
+    }
+    excess_risk_profiles = {
+        method: np.full((n_events, horizon), np.nan)
+        for method in methods
+    }
+    relative_gap_profiles = {
+        method: np.full((n_events, horizon), np.nan)
+        for method in methods
+    }
+    half_lives = {
+        method: np.full(n_events, np.nan)
+        for method in methods
+    }
+    recovery_delays = {
+        method: np.full(n_events, np.nan)
+        for method in methods
+    }
+
+    if n_events == 0:
+        warnings.warn("No latent oracle switches were detected in the OOS period.")
+    for ievent, t_event in enumerate(event_times):
+        horizon_end = min(t_event + horizon, data.config.T)
+        use_len = horizon_end - t_event
+        oos_start = t_event - data.config.T0
+
+        for method in methods:
+            method_weights = np.asarray(res.weights[method][oos_start:oos_start + use_len], dtype=float)
+            oracle_capture = np.zeros(use_len)
+            latent_risk = np.zeros(use_len)
+            excess_risk = np.zeros(use_len)
+
+            for h in range(use_len):
+                t_cur = t_event + h
+                oracle_w_t = oracle_combo_weights[t_cur]
+                w_t = simplex_project(method_weights[h])
+                oracle_capture[h] = 1.0 - 0.5 * np.abs(w_t - oracle_w_t).sum()
+                latent_risk[h] = latent_combination_risk(data, w_t, t_cur)
+                oracle_risk_t = latent_combination_risk(data, oracle_w_t, t_cur)
+                excess_risk[h] = max(latent_risk[h] - oracle_risk_t, 0.0)
+
+            initial_gap = max(excess_risk[0], EPS) if use_len else np.nan
+            relative_gap = excess_risk / initial_gap if use_len else np.array([])
+
+            overlap_profiles[method][ievent, :use_len] = oracle_capture
+            weight_profiles[method][ievent, :use_len] = oracle_capture
+            gap_profiles[method][ievent, :use_len] = 1.0 - oracle_capture
+            latent_risk_profiles[method][ievent, :use_len] = latent_risk
+            excess_risk_profiles[method][ievent, :use_len] = excess_risk
+            relative_gap_profiles[method][ievent, :use_len] = relative_gap
+
+            smooth_gap = _rolling_mean_1d(relative_gap, smooth_window)
+            baseline = float(smooth_gap[0]) if len(smooth_gap) else np.nan
+            if not np.isfinite(baseline):
+                continue
+            if baseline <= 0:
+                half_lives[method][ievent] = 0.0
+                recovery_delays[method][ievent] = 0.0
+                continue
+
+            half_target = 0.5 * baseline
+            half_idx = np.where(smooth_gap <= half_target)[0]
+            if len(half_idx):
+                half_lives[method][ievent] = float(half_idx[0])
+
+            target_gap_fraction = max(1.0 - target_oracle_weight, 0.0)
+            recovery_idx = np.where(smooth_gap <= target_gap_fraction)[0]
+            if len(recovery_idx):
+                recovery_delays[method][ievent] = float(recovery_idx[0])
+
+    rows = []
+    for method in methods:
+        profile0 = excess_risk_profiles[method][:, 0] if n_events else np.array([np.nan])
+        rows.append({
+            "Method": method,
+            "Events": n_events,
+            "Mean_Initial_Excess_Latent_Risk": _safe_nanmean(profile0),
+            "Mean_Integrated_Excess_Risk": _safe_nanmean(excess_risk_profiles[method]),
+            "Mean_Half_Life": _safe_nanmean(half_lives[method]),
+            "Median_Half_Life": _safe_nanmedian(half_lives[method]),
+            "Mean_Target_Closure_Delay": _safe_nanmean(recovery_delays[method]),
+            "Captured_Frac": float(np.mean(np.isfinite(recovery_delays[method]))) if n_events else np.nan,
+            "Mean_Oracle_Overlap": _safe_nanmean(overlap_profiles[method][:, 0]) if n_events else np.nan,
+        })
+    summary = pd.DataFrame(rows).sort_values(
+        ["Mean_Integrated_Excess_Risk", "Mean_Half_Life", "Mean_Target_Closure_Delay"],
+        ascending=[True, True, True],
+        na_position="last",
+    ).reset_index(drop=True)
+
+    return AdaptabilityResult(
+        methods=methods,
+        event_times=event_times,
+        oracle_models=oracle_models,
+        horizon=horizon,
+        smooth_window=smooth_window,
+        target_oracle_weight=target_oracle_weight,
+        oracle_portfolio_weights=oracle_combo_weights,
+        oracle_weight_profiles=weight_profiles,
+        oracle_gap_profiles=gap_profiles,
+        latent_risk_profiles=latent_risk_profiles,
+        excess_risk_profiles=excess_risk_profiles,
+        relative_gap_profiles=relative_gap_profiles,
+        half_lives=half_lives,
+        recovery_delays=recovery_delays,
+        summary_table=summary,
+    )
+
+
+# ---------- Adaptability visualization ----------
+
+def plot_adaptability_event_study(
+    adapt: AdaptabilityResult,
+    methods: Optional[Sequence[str]] = None,
+    ax=None,
+):
+    """
+    Plot the average excess latent risk profile after oracle-switch events.
+
+    Args:
+        adapt (AdaptabilityResult): Adaptability diagnostics output
+        methods (Sequence[str] | None): Optional method subset
+        ax: Optional matplotlib axes
+
+    Returns:
+        matplotlib.figure.Figure: Figure containing the event-study plot
+    """
+    if methods is None:
+        methods = adapt.methods
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(11, 5))
+    else:
+        fig = ax.figure
+
+    horizon_axis = np.arange(adapt.horizon)
+    for method in methods:
+        profile = adapt.excess_risk_profiles[method]
+        mean_profile = np.nanmean(profile, axis=0)
+        is_gcsr = method == "full_gcsr"
+        ax.plot(
+            horizon_axis,
+            mean_profile,
+            label=method,
+            linewidth=2.6 if is_gcsr else 1.5,
+            alpha=1.0 if is_gcsr else 0.85,
+            color="darkred" if is_gcsr else None,
+            zorder=3 if is_gcsr else 2,
+        )
+
+    ax.axhline(0.0, color="black", ls="--", linewidth=0.8)
+    ax.set_xlabel("Periods Since Latent Oracle Switch")
+    ax.set_ylabel("Excess Latent Risk vs Oracle Combination")
+    ax.set_title("Adaptability Event Study")
+    ax.legend(fontsize=8, ncol=2)
+    fig.tight_layout()
+    return fig
+
+
+def plot_adaptability_half_life(
+    adapt: AdaptabilityResult,
+    ax=None,
+):
+    """
+    Plot mean post-switch half-lives for each evaluated method.
+
+    Args:
+        adapt (AdaptabilityResult): Adaptability diagnostics output
+        ax: Optional matplotlib axes
+
+    Returns:
+        matplotlib.figure.Figure: Figure containing the half-life bar chart
+    """
+    df = adapt.summary_table.copy()
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(10, 5))
+    else:
+        fig = ax.figure
+    colors = ["darkred" if method == "full_gcsr" else "darkgreen" for method in df["Method"]]
+    ax.barh(df["Method"], df["Mean_Half_Life"], color=colors, alpha=0.85)
+    ax.set_xlabel("Mean Relative-Risk Half-Life")
+    ax.set_title("Adaptability Speed")
+    ax.invert_yaxis()
+    fig.tight_layout()
+    return fig
+
+
+def document_adaptability_measure() -> pd.DataFrame:
+    """
+    Summarize the design choices behind the adaptability diagnostic.
+
+    Returns:
+        pd.DataFrame: Compact documentation table for the metric definition
+    """
+    rows = [
+        {
+            "Item": "Metric",
+            "Description": "Post-switch excess latent-risk half-life.",
+            "Details": "A simulation-specific diagnostic rather than a named classical estimator.",
+            "Reference": "This implementation; inspired by Giacomini & Rossi (2009) and Tian & Anderson (2014)",
+        },
+        {
+            "Item": "Event definition",
+            "Description": "A switch occurs when the latent oracle forecaster changes.",
+            "Details": "The latent oracle is argmin_j {b_{j,t}^2 + sigma_{j,t}^2} under squared loss.",
+            "Reference": "Simulation design in this module",
+        },
+        {
+            "Item": "Gap series",
+            "Description": "Track excess latent risk relative to the oracle combination.",
+            "Details": (
+                "g_{m,e}(h) = R_m(t_e+h) - R^*(t_e+h), where R^* uses the "
+                "time-varying simplex-constrained oracle combination under the latent DGP."
+            ),
+            "Reference": "This implementation",
+        },
+        {
+            "Item": "Half-life",
+            "Description": "First horizon where the smoothed relative latent-risk gap is at most half the initial gap.",
+            "Details": "Smaller half-life means faster adaptation to the new best forecaster.",
+            "Reference": "This implementation",
+        },
+        {
+            "Item": "Interpretation",
+            "Description": "Separates immediate robustness from dynamic re-learning speed.",
+            "Details": (
+                "Combination methods such as GCSR are evaluated on how quickly their "
+                "latent expected risk approaches the oracle combination after regime shifts."
+            ),
+            "Reference": "Tian & Anderson (2014)",
+        },
+    ]
+    return pd.DataFrame(rows)
+
+
+def document_simulations() -> pd.DataFrame:
+    """High-level guide to the simulation designs implemented in this file."""
+    rows = [
+        {
+            "Scenario": "1A_stable_unbiased",
+            "Notebook_Analogue": "stable_unbiased",
+            "Mechanism": "No bias; homoskedastic idiosyncratic noise; common shock retained.",
+            "Instability": "None",
+        },
+        {
+            "Scenario": "1B_stable_biased",
+            "Notebook_Analogue": "stable_biased",
+            "Mechanism": "Forecaster-specific constant bias drawn once and held fixed.",
+            "Instability": "Persistent bias heterogeneity",
+        },
+        {
+            "Scenario": "2A_abrupt_break",
+            "Notebook_Analogue": "abrupt_break",
+            "Mechanism": "Forecaster-specific bias redraw at the break date.",
+            "Instability": "Abrupt bias shift",
+        },
+        {
+            "Scenario": "2B_smooth_drift",
+            "Notebook_Analogue": "smooth_drift",
+            "Mechanism": "Bias follows a local-trend process with persistent slope innovations.",
+            "Instability": "Smooth bias drift",
+        },
+        {
+            "Scenario": "2C_precision_shift",
+            "Notebook_Analogue": "precision_shift_smooth",
+            "Mechanism": "Log precision drifts smoothly, producing time-varying idiosyncratic variance.",
+            "Instability": "Smooth precision drift",
+        },
+        {
+            "Scenario": "3A_outliers",
+            "Notebook_Analogue": "idiosyncratic_outliers",
+            "Mechanism": "Occasional large signed idiosyncratic shocks replace Gaussian draws.",
+            "Instability": "Outlier contamination",
+        },
+        {
+            "Scenario": "3B_factor_dependence",
+            "Notebook_Analogue": "cross_sectional_dependence",
+            "Mechanism": "One-factor dependence across forecasters with heterogeneous loadings.",
+            "Instability": "Cross-sectional dependence",
+        },
+        {
+            "Scenario": "3C_clustered",
+            "Notebook_Analogue": "extension",
+            "Mechanism": "Cluster-level common factors generate within-cluster dependence.",
+            "Instability": "Clustered dependence",
+        },
+    ]
+    return pd.DataFrame(rows)
+
+
+def showcase_model_diagnostics(
+    data: SimulationData,
+    res: BacktestResult,
+    mcs_alpha: float = 0.10,
+    mcs_B: int = 500,
+    mcs_statistic: Literal["Tmax", "TR"] = "Tmax",
+    adaptability_horizon: int = 40,
+    adaptability_window: int = 5,
+) -> Dict[str, object]:
+    """Convenience wrapper that returns the main tables and plots for comparison."""
+    mcs = model_confidence_set(
+        res,
+        alpha=mcs_alpha,
+        B=mcs_B,
+        statistic=mcs_statistic,
+    )
+    mcs_table = compute_mcs_performance_table(res, mcs_result=mcs)
+    mcs_fig = plot_mcs_summary(res, mcs_result=mcs)
+
+    adaptability = compute_adaptability_diagnostics(
+        data,
+        res,
+        horizon=adaptability_horizon,
+        smooth_window=adaptability_window,
+    )
+    adaptability_fig = plot_adaptability_event_study(adaptability)
+    adaptability_half_life_fig = plot_adaptability_half_life(adaptability)
+
+    return {
+        "simulation_doc": document_simulations(),
+        "mcs_doc": document_mcs_procedure(),
+        "adaptability_doc": document_adaptability_measure(),
+        "references": methodology_references(),
+        "mcs_result": mcs,
+        "mcs_table": mcs_table,
+        "mcs_figure": mcs_fig,
+        "adaptability_result": adaptability,
+        "adaptability_table": adaptability.summary_table,
+        "adaptability_figure": adaptability_fig,
+        "adaptability_half_life_figure": adaptability_half_life_fig,
+    }
+
+
+# ===================================================================
+# 12.  EMPIRICAL INFLATION EVALUATION
+# ===================================================================
+
+# ---------- Empirical result container ----------
+
+@dataclass
+class EmpiricalStudyResult:
+    """
+    Store empirical data inputs, backtest outputs, and reporting tables.
+
+    The object is designed for direct inspection after running the empirical
+    next-quarter inflation exercise on the survey forecasts in `Empirical_Data`.
+    """
+    dataset_name: str
+    merged_data: pd.DataFrame
+    forecaster_ids: List[str]
+    training_periods: int
+    comparison_methods: List[str]
+    data: SimulationData
+    backtest: BacktestResult
+    performance_table: pd.DataFrame = field(default_factory=pd.DataFrame)
+    oos_forecast_table: pd.DataFrame = field(default_factory=pd.DataFrame)
+    mcs_result: Optional[MCSResult] = None
+    mcs_table: pd.DataFrame = field(default_factory=pd.DataFrame)
+
+
+# ---------- Empirical data preparation ----------
+
+def load_empirical_inflation_data(
+    forecast_path: str = "Empirical_Data/inflation_forecasts_f.csv",
+    truth_path: str = "Empirical_Data/inflation_truth_f.csv",
+    training_periods: int = 20,
+    loss_name: str = "squared",
+) -> Tuple[SimulationData, pd.DataFrame, List[str]]:
+    """
+    Load and align the empirical next-quarter inflation forecast panel.
+
+    The empirical files are assumed to be clean, aligned, and already ordered
+    chronologically. The loader therefore keeps the input structure simple and
+    converts the two CSVs directly into the `SimulationData` container used by
+    the backtest engine.
+
+    Args:
+        forecast_path (str): Path to the `T x M` forecast matrix CSV
+        truth_path (str): Path to the realized inflation CSV
+        training_periods (int): First OOS index
+        loss_name (str): Loss function used to construct empirical losses
+
+    Returns:
+        Tuple[SimulationData, pd.DataFrame, List[str]]: Backtest-ready data,
+        aligned empirical panel, and ordered forecaster identifiers
+    """
+    training_periods = max(int(training_periods), 20)
+    loss_fn = LOSS_REGISTRY.get(loss_name, squared_loss)
+
+    forecasts_df = pd.read_csv(forecast_path)
+    truth_df = pd.read_csv(truth_path)
+    forecaster_ids = [col for col in forecasts_df.columns if col != "TARGET_PERIOD"]
+    merged = forecasts_df.copy()
+    merged["actual"] = truth_df["actual"].to_numpy()
+    merged["period_dt"] = pd.to_datetime(merged["TARGET_PERIOD"])
+    numeric_cols = forecaster_ids + ["actual"]
+    merged[numeric_cols] = merged[numeric_cols].astype(float)
+
+    T = len(merged)
+    M = len(forecaster_ids)
+
+    y = merged["actual"].to_numpy(dtype=float)
+    forecasts = merged[forecaster_ids].to_numpy(dtype=float)
+    errors = y[:, None] - forecasts
+    losses = loss_fn(y[:, None], forecasts)
+
+    cfg = ScenarioConfig(
+        name="empirical_inflation_next_quarter",
+        M=M,
+        T=T,
+        T0=training_periods,
+        sigma_common=0.0,
+        seed=RNG_SEED,
+    )
+    data = SimulationData(
+        y=y,
+        forecasts=forecasts,
+        errors=errors,
+        losses=losses,
+        bias_paths=np.zeros((T, M)),
+        sigma_paths=np.ones((T, M)),
+        common_shock=np.zeros(T),
+        config=cfg,
+    )
+    return data, merged, forecaster_ids
+
+
+def _default_empirical_bt_config(training_periods: int = 20) -> BacktestConfig:
+    """
+    Build a stable backtest configuration for the empirical inflation study.
+
+    Args:
+        training_periods (int): Minimum amount of historical data available
+            before the OOS evaluation begins
+
+    Returns:
+        BacktestConfig: Default empirical backtest hyper-parameters
+    """
+    window = max(training_periods, 20)
+    return BacktestConfig(
+        d_max=3,
+        cov_window=window,
+        bg_window=window,
+        tune_window=window,
+        recent_best_window=min(8, window),
+        min_history=window,
+    )
+
+
+def _select_empirical_comparison_methods(
+    performance_table: pd.DataFrame,
+    max_methods: int = 6,
+) -> List[str]:
+    """
+    Pick a readable comparison set anchored on `full_gcsr`.
+
+    Args:
+        performance_table (pd.DataFrame): Method-level performance summary
+        max_methods (int): Maximum number of methods to keep in the plot set
+
+    Returns:
+        List[str]: Ordered list of methods for empirical comparison plots
+    """
+    preferred = [
+        "full_gcsr",
+        "bates_granger_mv",
+        "cov_only",
+        "recent_best",
+        "graph_only",
+        "equal",
+        "median",
+    ]
+    available = performance_table["Method"].tolist()
+    selected = []
+    for name in preferred:
+        if name in available and name not in selected:
+            selected.append(name)
+        if len(selected) >= max_methods:
+            return selected
+    for name in available:
+        if name not in selected:
+            selected.append(name)
+        if len(selected) >= max_methods:
+            break
+    return selected
+
+
+# ---------- Empirical study runner ----------
+
+def build_empirical_oos_forecast_table(
+    study: EmpiricalStudyResult,
+    methods: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    """
+    Construct a tidy OOS table of actual inflation and combined forecasts.
+
+    Args:
+        study (EmpiricalStudyResult): Empirical study output
+        methods (Sequence[str] | None): Optional method subset
+
+    Returns:
+        pd.DataFrame: OOS table indexed by target period
+    """
+    if methods is None:
+        methods = study.comparison_methods
+    methods = [m for m in methods if m in study.backtest.combined_forecasts]
+
+    idx = study.backtest.oos_periods
+    df = pd.DataFrame({
+        "TARGET_PERIOD": study.merged_data.loc[idx, "TARGET_PERIOD"].to_numpy(),
+        "period_dt": study.merged_data.loc[idx, "period_dt"].to_numpy(),
+        "actual": study.data.y[idx],
+    })
+    for method in methods:
+        df[method] = study.backtest.combined_forecasts[method]
+    return df.reset_index(drop=True)
+
+
+def run_empirical_inflation_study(
+    forecast_path: str = "Empirical_Data/inflation_forecasts_f.csv",
+    truth_path: str = "Empirical_Data/inflation_truth_f.csv",
+    training_periods: int = 20,
+    bt_cfg: Optional[BacktestConfig] = None,
+    mcs_alpha: float = 0.10,
+    mcs_B: int = 500,
+    mcs_statistic: Literal["Tmax", "TR"] = "Tmax",
+    verbose: bool = False,
+) -> EmpiricalStudyResult:
+    """
+    Run a next-quarter out-of-sample empirical backtest on the inflation panel.
+
+    The exercise treats each row as a forecast for the next target quarter,
+    starts evaluation after `training_periods` observations, and compares the
+    full GCSR method with the benchmark combination rules already defined in
+    this module.
+
+    Args:
+        forecast_path (str): Path to the empirical forecast CSV
+        truth_path (str): Path to the realized inflation CSV
+        training_periods (int): In-sample history available before OOS testing
+        bt_cfg (BacktestConfig | None): Optional empirical backtest configuration
+        mcs_alpha (float): Model Confidence Set significance level
+        mcs_B (int): Number of MCS bootstrap resamples
+        mcs_statistic (Literal["Tmax", "TR"]): MCS test statistic
+        verbose (bool): Whether to print rolling backtest progress
+
+    Returns:
+        EmpiricalStudyResult: Empirical data, backtest output, and summary tables
+    """
+    data, merged, forecaster_ids = load_empirical_inflation_data(
+        forecast_path=forecast_path,
+        truth_path=truth_path,
+        training_periods=training_periods,
+    )
+
+    if bt_cfg is None:
+        bt_cfg = _default_empirical_bt_config(training_periods=training_periods)
+    else:
+        bt_cfg.min_history = max(int(bt_cfg.min_history), 20)
+
+    res = run_backtest(data, bt_cfg=bt_cfg, verbose=verbose)
+    performance = compute_performance_table(res)
+    comparison_methods = _select_empirical_comparison_methods(performance)
+    mcs_result = model_confidence_set(
+        res,
+        alpha=mcs_alpha,
+        B=mcs_B,
+        statistic=mcs_statistic,
+    )
+    mcs_table = compute_mcs_performance_table(res, mcs_result=mcs_result)
+
+    study = EmpiricalStudyResult(
+        dataset_name="empirical_inflation_next_quarter",
+        merged_data=merged,
+        forecaster_ids=forecaster_ids,
+        training_periods=training_periods,
+        comparison_methods=comparison_methods,
+        data=data,
+        backtest=res,
+        performance_table=performance,
+        mcs_result=mcs_result,
+        mcs_table=mcs_table,
+    )
+    study.oos_forecast_table = build_empirical_oos_forecast_table(study)
+    return study
+
+
+# ---------- Empirical visualization ----------
+
+def plot_empirical_oos_forecasts(
+    study: EmpiricalStudyResult,
+    methods: Optional[Sequence[str]] = None,
+    ax=None,
+):
+    """
+    Plot realized inflation against combined next-quarter OOS forecasts.
+
+    Args:
+        study (EmpiricalStudyResult): Empirical study output
+        methods (Sequence[str] | None): Optional method subset
+        ax: Optional matplotlib axes
+
+    Returns:
+        matplotlib.figure.Figure: Figure containing the OOS forecast comparison
+    """
+    df = build_empirical_oos_forecast_table(study, methods=methods)
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(12, 5))
+    else:
+        fig = ax.figure
+
+    ax.plot(df["period_dt"], df["actual"], color="black", linewidth=2.2, label="actual")
+    for method in [c for c in df.columns if c not in {"TARGET_PERIOD", "period_dt", "actual"}]:
+        is_gcsr = method == "full_gcsr"
+        ax.plot(
+            df["period_dt"],
+            df[method],
+            label=method,
+            linewidth=2.4 if is_gcsr else 1.4,
+            alpha=1.0 if is_gcsr else 0.85,
+            color="darkred" if is_gcsr else None,
+            zorder=3 if is_gcsr else 2,
+        )
+    ax.set_title("Empirical Next-Quarter Inflation Forecasts")
+    ax.set_xlabel("Target Quarter")
+    ax.set_ylabel("Inflation")
+    ax.legend(fontsize=8, ncol=2)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    return fig
+
+
+def plot_empirical_cumulative_loss(
+    study: EmpiricalStudyResult,
+    methods: Optional[Sequence[str]] = None,
+    reference: str = "equal",
+):
+    """
+    Plot cumulative loss differences for the empirical OOS exercise.
+
+    Args:
+        study (EmpiricalStudyResult): Empirical study output
+        methods (Sequence[str] | None): Optional method subset
+        reference (str): Reference method used in the cumulative-loss plot
+
+    Returns:
+        matplotlib.figure.Figure: Figure containing the cumulative-loss comparison
+    """
+    if methods is None:
+        methods = study.comparison_methods
+    fig = plot_cumulative_loss(study.backtest, methods=list(methods), reference=reference)
+    ax = fig.axes[0]
+    ax.set_title("Empirical Cumulative Loss Difference")
+    ax.set_xlabel("OOS Index")
+    return fig
+
+
+def plot_empirical_weight_comparison(
+    study: EmpiricalStudyResult,
+    methods: Optional[Sequence[str]] = None,
+):
+    """
+    Plot empirical weight paths for the main combination methods.
+
+    Args:
+        study (EmpiricalStudyResult): Empirical study output
+        methods (Sequence[str] | None): Optional method subset
+
+    Returns:
+        matplotlib.figure.Figure: Figure containing the weight time series
+    """
+    if methods is None:
+        methods = ["full_gcsr", "cov_only", "graph_only", "bates_granger_mv"]
+    methods = [m for m in methods if m in study.backtest.weights]
+    return plot_weight_timeseries(study.backtest, methods=methods)
+
+
+def showcase_empirical_inflation_study(
+    forecast_path: str = "Empirical_Data/inflation_forecasts_f.csv",
+    truth_path: str = "Empirical_Data/inflation_truth_f.csv",
+    training_periods: int = 20,
+    bt_cfg: Optional[BacktestConfig] = None,
+    mcs_alpha: float = 0.10,
+    mcs_B: int = 500,
+    mcs_statistic: Literal["Tmax", "TR"] = "Tmax",
+    verbose: bool = False,
+) -> Dict[str, object]:
+    """
+    Run the empirical inflation study and return the main tables and plots.
+
+    Args:
+        forecast_path (str): Path to the empirical forecast CSV
+        truth_path (str): Path to the realized inflation CSV
+        training_periods (int): Number of initial periods reserved for training
+        bt_cfg (BacktestConfig | None): Optional backtest configuration
+        mcs_alpha (float): Model Confidence Set significance level
+        mcs_B (int): Number of MCS bootstrap resamples
+        mcs_statistic (Literal["Tmax", "TR"]): MCS test statistic
+        verbose (bool): Whether to print rolling backtest progress
+
+    Returns:
+        Dict[str, object]: Empirical study object plus comparison tables and figures
+    """
+    study = run_empirical_inflation_study(
+        forecast_path=forecast_path,
+        truth_path=truth_path,
+        training_periods=training_periods,
+        bt_cfg=bt_cfg,
+        mcs_alpha=mcs_alpha,
+        mcs_B=mcs_B,
+        mcs_statistic=mcs_statistic,
+        verbose=verbose,
+    )
+
+    mcs_fig = plot_mcs_summary(
+        study.backtest,
+        mcs_result=study.mcs_result,
+        methods=study.comparison_methods,
+    )
+    oos_fig = plot_empirical_oos_forecasts(study)
+    cumulative_fig = plot_empirical_cumulative_loss(study)
+    weights_fig = plot_empirical_weight_comparison(study)
+
+    return {
+        "study": study,
+        "performance_table": study.performance_table,
+        "mcs_table": study.mcs_table,
+        "oos_forecast_table": study.oos_forecast_table,
+        "mcs_figure": mcs_fig,
+        "oos_forecast_figure": oos_fig,
+        "cumulative_loss_figure": cumulative_fig,
+        "weights_figure": weights_fig,
+    }
+
+
+# ===================================================================
+# 13.  LEAKAGE AUDIT UTILITIES
 # ===================================================================
 
 def leakage_audit_synthetic(seed=123):
@@ -2093,7 +3912,7 @@ def print_timing_rules():
 
 
 # ===================================================================
-# 12.  CONVENIENCE: RUN ALL SCENARIOS
+# 14.  CONVENIENCE: RUN ALL SCENARIOS
 # ===================================================================
 
 def run_all_scenarios(
