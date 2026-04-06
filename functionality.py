@@ -43,6 +43,7 @@ RNG_SEED = 42
 EPS = 1e-12          # generic numerical floor
 RIDGE_COV = 1e-6     # default ridge for covariance matrices
 TELEPORT = 1e-6      # default teleportation for eigenvector centrality
+SIGNED_WEIGHT_METHODS = {"full_gcsr_relaxed"}
 
 
 def _ensure_rng(seed=None):
@@ -744,6 +745,39 @@ def full_combination_weights(
     return _solve_combination_qp(Sigma_r, r, alpha, gamma, M)
 
 
+def full_combination_weights_relaxed(
+    Sigma: np.ndarray,
+    r: np.ndarray,
+    alpha: float,
+    gamma: float,
+    ridge: float = RIDGE_COV,
+) -> np.ndarray:
+    """
+    Full graph-covariance-shrinkage combination with only the affine-sum
+    constraint retained.
+
+    argmin_w  w'Sigma w  - alpha * r'w  + gamma * ||w - wbar||^2
+    s.t.      1'w = 1
+    """
+    M = Sigma.shape[0]
+    Sigma_r = regularise_cov(Sigma, ridge)
+    return _solve_combination_affine(Sigma_r, r, alpha, gamma, M)
+
+
+def _combination_objective_terms(
+    Sigma: np.ndarray,
+    r: np.ndarray,
+    alpha: float,
+    gamma: float,
+    M: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Quadratic and linear terms shared by the constrained solvers."""
+    wbar = np.ones(M) / M
+    Q = Sigma + gamma * np.eye(M)
+    c = -(alpha * r + 2.0 * gamma * wbar)
+    return Q, c
+
+
 def _solve_combination_qp(
     Sigma: np.ndarray,
     r: np.ndarray,
@@ -754,17 +788,7 @@ def _solve_combination_qp(
     """Core QP solver using scipy."""
     wbar = np.ones(M) / M
 
-    # Q = Sigma + gamma * I
-    Q = Sigma + gamma * np.eye(M)
-    # linear term: -alpha * r + (-2*gamma * wbar handled via expansion)
-    # objective: 0.5 * w'(2Q)w + c'w
-    # but we write: min w'Q w - alpha r'w + gamma w'w - 2gamma wbar'w + gamma wbar'wbar
-    # = w' (Sigma + gamma I) w  - (alpha r + 2 gamma wbar)'w + const
-    # Actually let's be precise:
-    # f(w) = w' Sigma w - alpha r'w + gamma (w-wbar)'(w-wbar)
-    #       = w' Sigma w - alpha r'w + gamma w'w - 2 gamma wbar'w + gamma wbar'wbar
-    #       = w' (Sigma + gamma I) w - (alpha r + 2 gamma wbar)' w + const
-    c = -(alpha * r + 2.0 * gamma * wbar)
+    Q, c = _combination_objective_terms(Sigma, r, alpha, gamma, M)
 
     def objective(w):
         return w @ Q @ w + c @ w
@@ -794,6 +818,39 @@ def _solve_combination_qp(
     # safety project
     w_opt = np.maximum(w_opt, 0.0)
     w_opt /= w_opt.sum() + EPS
+    return w_opt
+
+
+def _solve_combination_affine(
+    Sigma: np.ndarray,
+    r: np.ndarray,
+    alpha: float,
+    gamma: float,
+    M: int,
+) -> np.ndarray:
+    """Closed-form equality-constrained solution allowing signed weights."""
+    Q, c = _combination_objective_terms(Sigma, r, alpha, gamma, M)
+    ones = np.ones(M)
+    wbar = np.ones(M) / M
+
+    try:
+        q_inv_ones = np.linalg.solve(Q, ones)
+        q_inv_c = np.linalg.solve(Q, c)
+        denom = float(ones @ q_inv_ones)
+        if abs(denom) < EPS:
+            return wbar.copy()
+        lagrange = -(2.0 + float(ones @ q_inv_c)) / denom
+        w_opt = -0.5 * (q_inv_c + lagrange * q_inv_ones)
+    except LinAlgError:
+        return wbar.copy()
+
+    if not np.all(np.isfinite(w_opt)):
+        return wbar.copy()
+
+    # Re-enforce the affine constraint after the linear solve to remove tiny
+    # numerical drift while preserving the signed allocation profile.
+    w_opt = np.asarray(w_opt, dtype=float)
+    w_opt -= (w_opt.sum() - 1.0) / M
     return w_opt
 
 
@@ -1620,6 +1677,7 @@ def run_backtest(
         "graph_only",
         "cov_only",
         "full_gcsr",
+        "full_gcsr_relaxed",
         "mult_tilt",
     ]
     for name in method_names:
@@ -1768,7 +1826,13 @@ def run_backtest(
         w_full = full_combination_weights(Sigma, r, alpha_sel, gamma_sel, bt_cfg.ridge_cov)
         res.weights["full_gcsr"][oos_idx] = w_full
 
-        # 10. Multiplicative tilt
+        # 10. Full GCSR with signed weights
+        w_full_relaxed = full_combination_weights_relaxed(
+            Sigma, r, alpha_sel, gamma_sel, bt_cfg.ridge_cov
+        )
+        res.weights["full_gcsr_relaxed"][oos_idx] = w_full_relaxed
+
+        # 11. Multiplicative tilt
         kappa = alpha_sel  # re-use
         w_mt = multiplicative_tilt_weights(w_co, r, kappa)
         res.weights["mult_tilt"][oos_idx] = w_mt
@@ -1994,6 +2058,24 @@ set_plot_style()
 
 
 # ---------- A. Scenario Visualization ----------
+
+def _method_plot_style(method: str) -> Dict[str, Union[float, int, str]]:
+    """Consistent highlighting for the two GCSR variants."""
+    if method == "full_gcsr":
+        return {"linewidth": 2.4, "alpha": 1.0, "color": "darkred", "zorder": 3}
+    if method == "full_gcsr_relaxed":
+        return {"linewidth": 2.2, "alpha": 0.95, "color": "darkorange", "zorder": 3}
+    return {"linewidth": 1.4, "alpha": 0.85, "zorder": 2}
+
+
+def _method_bar_color(method: str, default: str = "steelblue") -> str:
+    """Consistent bar colors for the GCSR family."""
+    if method == "full_gcsr":
+        return "darkred"
+    if method == "full_gcsr_relaxed":
+        return "darkorange"
+    return default
+
 
 def plot_bias_paths(data: SimulationData, ax=None):
     """Plot latent bias paths b_{j,t}."""
@@ -2248,6 +2330,87 @@ def plot_weight_diagnostics(res: BacktestResult, methods=None):
     return fig
 
 
+def plot_gcsr_weight_comparison(
+    res: BacktestResult,
+    constrained_method: str = "full_gcsr",
+    relaxed_method: str = "full_gcsr_relaxed",
+    top_n: Optional[int] = None,
+):
+    """
+    Compare simplex-constrained and signed GCSR weights via heatmaps.
+
+    Args:
+        res (BacktestResult): Rolling backtest output
+        constrained_method (str): Name of the simplex-constrained method
+        relaxed_method (str): Name of the signed-weight affine method
+        top_n (int | None): Optional cap on the number of forecasters shown,
+            keeping those with the largest mean absolute exposure
+
+    Returns:
+        matplotlib.figure.Figure: Figure containing two weight heatmaps and
+        their signed difference
+    """
+    if constrained_method not in res.weights:
+        raise KeyError(f"Missing weights for method '{constrained_method}'")
+    if relaxed_method not in res.weights:
+        raise KeyError(f"Missing weights for method '{relaxed_method}'")
+
+    w_constrained = np.asarray(res.weights[constrained_method], dtype=float)
+    w_relaxed = np.asarray(res.weights[relaxed_method], dtype=float)
+    if w_constrained.shape != w_relaxed.shape:
+        raise ValueError("The compared weight matrices must have the same shape.")
+
+    M = w_constrained.shape[1]
+    selected = np.arange(M)
+    if top_n is not None and 0 < top_n < M:
+        exposure = np.maximum(
+            np.mean(np.abs(w_constrained), axis=0),
+            np.mean(np.abs(w_relaxed), axis=0),
+        )
+        selected = np.sort(np.argsort(exposure)[::-1][:top_n])
+
+    panels = [
+        (w_constrained[:, selected].T, f"{constrained_method} weights"),
+        (w_relaxed[:, selected].T, f"{relaxed_method} weights"),
+        ((w_relaxed - w_constrained)[:, selected].T, f"{relaxed_method} - {constrained_method}"),
+    ]
+    vmax = max(np.max(np.abs(panel)) for panel, _ in panels)
+    vmax = max(float(vmax), EPS)
+
+    fig_height = max(7.5, 5.0 + 0.18 * len(selected))
+    fig, axes = plt.subplots(3, 1, figsize=(14, fig_height), sharex=True)
+    image = None
+    for ax, (panel, title) in zip(axes, panels):
+        image = ax.imshow(
+            panel,
+            aspect="auto",
+            interpolation="nearest",
+            cmap="RdBu_r",
+            vmin=-vmax,
+            vmax=vmax,
+        )
+        ax.set_title(title)
+        ax.set_ylabel("Forecaster")
+
+    tick_step = max(1, len(selected) // 10)
+    tick_idx = np.arange(0, len(selected), tick_step)
+    tick_labels = [f"M{selected[i] + 1}" for i in tick_idx]
+    for ax in axes:
+        ax.set_yticks(tick_idx)
+        ax.set_yticklabels(tick_labels)
+
+    if len(res.oos_periods) > 0:
+        xtick_idx = np.linspace(0, len(res.oos_periods) - 1, min(6, len(res.oos_periods)), dtype=int)
+        axes[-1].set_xticks(xtick_idx)
+        axes[-1].set_xticklabels(res.oos_periods[xtick_idx])
+    axes[-1].set_xlabel("OOS period")
+
+    cbar = fig.colorbar(image, ax=axes, shrink=0.96)
+    cbar.set_label("Weight")
+    fig.subplots_adjust(hspace=0.35, right=0.92)
+    return fig
+
+
 # ---------- D. Covariance Diagnostics ----------
 
 def plot_covariance_diagnostics(res: BacktestResult):
@@ -2300,7 +2463,8 @@ def plot_cumulative_loss(res: BacktestResult, methods=None, reference="equal"):
         if name == reference:
             continue
         diff = np.cumsum(res.combined_losses[name] - ref_loss)
-        ax.plot(res.oos_periods, diff, label=name, alpha=0.8, linewidth=1.2)
+        style = _method_plot_style(name)
+        ax.plot(res.oos_periods, diff, label=name, **style)
     ax.axhline(0, color="black", ls="-", linewidth=0.5)
     ax.set_title(f"Cumulative Loss Difference vs {reference}")
     ax.set_xlabel("Time")
@@ -2334,7 +2498,7 @@ def plot_msfe_barplot(res: BacktestResult, ax=None):
     df = compute_performance_table(res)
     if ax is None:
         fig, ax = plt.subplots(figsize=(10, 5))
-    colors = ["steelblue" if n != "full_gcsr" else "darkred" for n in df.Method]
+    colors = [_method_bar_color(n) for n in df.Method]
     ax.barh(df.Method, df.Rel_MSFE, color=colors, alpha=0.8)
     ax.axvline(1.0, color="black", ls="--", linewidth=0.8)
     ax.set_xlabel("Relative MSFE (vs Equal Weights)")
@@ -3207,16 +3371,8 @@ def plot_adaptability_event_study(
     for method in methods:
         profile = adapt.excess_risk_profiles[method]
         mean_profile = np.nanmean(profile, axis=0)
-        is_gcsr = method == "full_gcsr"
-        ax.plot(
-            horizon_axis,
-            mean_profile,
-            label=method,
-            linewidth=2.6 if is_gcsr else 1.5,
-            alpha=1.0 if is_gcsr else 0.85,
-            color="darkred" if is_gcsr else None,
-            zorder=3 if is_gcsr else 2,
-        )
+        style = _method_plot_style(method)
+        ax.plot(horizon_axis, mean_profile, label=method, **style)
 
     ax.axhline(0.0, color="black", ls="--", linewidth=0.8)
     ax.set_xlabel("Periods Since Latent Oracle Switch")
@@ -3246,7 +3402,7 @@ def plot_adaptability_half_life(
         fig, ax = plt.subplots(figsize=(10, 5))
     else:
         fig = ax.figure
-    colors = ["darkred" if method == "full_gcsr" else "darkgreen" for method in df["Method"]]
+    colors = [_method_bar_color(method, default="darkgreen") for method in df["Method"]]
     ax.barh(df["Method"], df["Mean_Half_Life"], color=colors, alpha=0.85)
     ax.set_xlabel("Mean Relative-Risk Half-Life")
     ax.set_title("Adaptability Speed")
@@ -3533,11 +3689,12 @@ def _select_empirical_comparison_methods(
     """
     preferred = [
         "full_gcsr",
+        "full_gcsr_relaxed",
         "bates_granger_mv",
         "cov_only",
-        "recent_best",
         "graph_only",
         "equal",
+        "recent_best",
         "median",
     ]
     available = performance_table["Method"].tolist()
@@ -3601,8 +3758,8 @@ def run_empirical_inflation_study(
 
     The exercise treats each row as a forecast for the next target quarter,
     starts evaluation after `training_periods` observations, and compares the
-    full GCSR method with the benchmark combination rules already defined in
-    this module.
+    simplex and signed GCSR variants with the benchmark combination rules
+    already defined in this module.
 
     Args:
         forecast_path (str): Path to the empirical forecast CSV
@@ -3681,16 +3838,8 @@ def plot_empirical_oos_forecasts(
 
     ax.plot(df["period_dt"], df["actual"], color="black", linewidth=2.2, label="actual")
     for method in [c for c in df.columns if c not in {"TARGET_PERIOD", "period_dt", "actual"}]:
-        is_gcsr = method == "full_gcsr"
-        ax.plot(
-            df["period_dt"],
-            df[method],
-            label=method,
-            linewidth=2.4 if is_gcsr else 1.4,
-            alpha=1.0 if is_gcsr else 0.85,
-            color="darkred" if is_gcsr else None,
-            zorder=3 if is_gcsr else 2,
-        )
+        style = _method_plot_style(method)
+        ax.plot(df["period_dt"], df[method], label=method, **style)
     ax.set_title("Empirical Next-Quarter Inflation Forecasts")
     ax.set_xlabel("Target Quarter")
     ax.set_ylabel("Inflation")
@@ -3745,6 +3894,23 @@ def plot_empirical_weight_comparison(
     return plot_weight_timeseries(study.backtest, methods=methods)
 
 
+def plot_empirical_gcsr_weight_comparison(
+    study: EmpiricalStudyResult,
+    top_n: Optional[int] = None,
+):
+    """
+    Compare the simplex and signed GCSR weight paths in the empirical study.
+
+    Args:
+        study (EmpiricalStudyResult): Empirical study output
+        top_n (int | None): Optional cap on the number of forecasters shown
+
+    Returns:
+        matplotlib.figure.Figure: Figure containing the GCSR weight comparison
+    """
+    return plot_gcsr_weight_comparison(study.backtest, top_n=top_n)
+
+
 def showcase_empirical_inflation_study(
     forecast_path: str = "Empirical_Data/inflation_forecasts_f.csv",
     truth_path: str = "Empirical_Data/inflation_truth_f.csv",
@@ -3790,6 +3956,7 @@ def showcase_empirical_inflation_study(
     oos_fig = plot_empirical_oos_forecasts(study)
     cumulative_fig = plot_empirical_cumulative_loss(study)
     weights_fig = plot_empirical_weight_comparison(study)
+    gcsr_weights_fig = plot_empirical_gcsr_weight_comparison(study)
 
     return {
         "study": study,
@@ -3800,6 +3967,7 @@ def showcase_empirical_inflation_study(
         "oos_forecast_figure": oos_fig,
         "cumulative_loss_figure": cumulative_fig,
         "weights_figure": weights_fig,
+        "gcsr_weight_comparison_figure": gcsr_weights_fig,
     }
 
 
@@ -3874,6 +4042,8 @@ def leakage_audit_synthetic(seed=123):
 
     # Check non-negativity
     for name in res.weights:
+        if name in SIGNED_WEIGHT_METHODS:
+            continue
         w = res.weights[name]
         if np.any(w < -1e-8):
             notes.append(f"WARNING: {name} has negative weights")
